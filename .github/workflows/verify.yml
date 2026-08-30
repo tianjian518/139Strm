@@ -1,0 +1,57 @@
+name: Verify Published Image
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Build & Push Multi-Arch Image"]
+    types: [completed]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 登录 Docker Hub 并检查镜像
+        run: |
+          USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
+          IMAGE="$USERNAME/139strm"
+
+          TOKEN=$(curl -s -X POST https://hub.docker.com/v2/users/login/ \
+            -H "Content-Type: application/json" \
+            -d '{"username":"'"$USERNAME"'","password":"${{ secrets.DOCKERHUB_TOKEN }}"}' \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
+          echo "## 镜像验证结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          for TAG in latest 1.0 1; do
+            echo "--- 检查 $IMAGE:$TAG ---"
+            CODE=$(curl -s -o /tmp/manifest.json -w "%{http_code}" \
+              -H "Authorization: JWT $TOKEN" \
+              "https://hub.docker.com/v2/repositories/$IMAGE/tags/$TAG/")
+            echo "  HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              python3 - "$TAG" <<'PY' >> $GITHUB_STEP_SUMMARY
+          import json, sys
+          d = json.load(open("/tmp/manifest.json"))
+          tag = sys.argv[1]
+          imgs = d.get("images", [])
+          print(f"### `{tag}`")
+          print("")
+          print("| 架构 | 系统 | 摘要 |")
+          print("|---|---|---|")
+          for i in imgs:
+              print(f"| {i.get('architecture')} | {i.get('os')} | `{str(i.get('digest'))[:26]}…` |")
+          print(f"")
+          print(f"镜像全名：`{d.get('namespace')}/{d.get('name')}:{tag}`")
+          print("")
+          PY
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/manifest.json'))
+          print('  架构:', [i.get('architecture') for i in d.get('images',[])])
+          print('  大小:', round(sum(i.get('size',0) for i in d.get('images',[]))/1048576,1), 'MB')
+          "
+            else
+              echo "  ❌ 标签不存在" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
