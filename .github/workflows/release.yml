@@ -52,7 +52,7 @@ jobs:
                   rows.append("| {} | {} | `{}…` | {:.1f} MB |".format(
                       i.get("architecture"), i.get("os"),
                       str(i.get("digest"))[:30], size / 1048576))
-              lines.append("\n**`{}/{}:{}`**\n".format(d.get("namespace"), d.get("name"), tag))
+              lines.append("\n**`{}:{}`**\n".format(image, tag))
               lines.append("| 架构 | 系统 | 摘要 | 体积 |")
               lines.append("|---|---|---|---|")
               lines.extend(rows)
