@@ -1,0 +1,19 @@
+name: 139strm
+services:
+  139strm:
+    image: tianjian518/139strm:1.0      # 本地构建请把这行换成：build: .
+    container_name: 139strm
+    restart: unless-stopped
+    ports:
+      - "8025:8025"
+    volumes:
+      - ./config:/app/config          # 配置与凭据持久化
+      - ./strm:/strm                  # 生成的 strm 目录，Emby 也挂载这个
+    environment:
+      - PORT=8025
+      - CONFIG_PATH=/app/config/config.json
+      - YUN139_OUTPUT_DIR=/strm
+      - TZ=Asia/Shanghai
+      # 可选：直接通过环境变量注入凭据，优先级高于界面配置
+      # - YUN139_AUTHORIZATION=
+      # - YUN139_CLOUD_TYPE=personal_new

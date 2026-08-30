@@ -1,0 +1,15 @@
+# 配置与凭据
+config.json
+config/
+# Python
+__pycache__/
+*.pyc
+*.py[cod]
+.venv/
+venv/
+# 生成的 strm
+strm/
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>139Strm · 移动云盘 STRM 工具</title>
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--ink:#1b1e23;--sub:#6b7280;--line:#e5e7eb;
+--brand:#2563eb;--ok:#0f9d58;--bad:#dc2626;--warn:#e8912a;--soft:#eef4ff}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;padding:18px 14px 50px}
+.wrap{max-width:900px;margin:0 auto}
+header{background:linear-gradient(135deg,#2563eb,#1e40af);color:#fff;border-radius:14px;padding:20px 22px;margin-bottom:16px}
+header h1{font-size:20px;font-weight:700}
+header p{opacity:.9;font-size:13.5px;margin-top:6px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:14px}
+h2{font-size:17px;font-weight:700;margin-bottom:12px;padding-left:10px;border-left:4px solid var(--brand)}
+label{display:block;font-size:13.5px;font-weight:600;margin:10px 0 4px;color:#374151}
+.hint{font-size:12.5px;color:var(--sub);margin-bottom:4px}
+input,select,textarea{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:14px;font-family:inherit}
+textarea{min-height:70px;resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
+button{background:var(--brand);color:#fff;border:0;border-radius:8px;padding:9px 18px;font-size:14px;font-weight:600;cursor:pointer;margin-top:12px}
+button:hover{filter:brightness(1.08)}
+button:disabled{background:#9ca3af;cursor:not-allowed}
+button.sec{background:#6b7280}
+button.ok{background:var(--ok)}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.msg{margin-top:12px;padding:10px 14px;border-radius:8px;font-size:13.5px;display:none}
+.msg.show{display:block}
+.msg.ok{background:#e6f6ee;color:#0b7a45;border:1px solid #b7e4cd}
+.msg.err{background:#fdecec;color:#b91c1c;border:1px solid #f5c2c2}
+.msg.info{background:var(--soft);color:#1a45b8;border:1px solid #cfe0ff}
+table{width:100%;border-collapse:collapse;font-size:13.5px;margin-top:10px}
+th,td{border:1px solid var(--line);padding:7px 9px;text-align:left}
+th{background:#f3f5f9}
+.dir{color:var(--brand);cursor:pointer;font-weight:600}
+.dir:hover{text-decoration:underline}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
+.pill{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;font-weight:600}
+.p-ok{background:#e3f6ec;color:#0b7a45}
+.p-run{background:#fff0dd;color:#a36208}
+.badge{float:right;font-size:12px;color:var(--sub);font-weight:400}
+pre.log{background:#1e2229;color:#d6d6d6;padding:12px;border-radius:8px;font-size:12px;max-height:260px;overflow:auto;margin-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>139Strm · 移动云盘 STRM 工具</h1>
+  <p>直连移动云盘，生成 .strm 供 Emby / Jellyfin 入库；播放走 302 直跳云盘，不占本机带宽</p>
+</header>
+
+<!-- 配置 -->
+<div class="card">
+  <h2>1. 连接移动云盘</h2>
+
+  <label>Authorization（从 yun.139.com 抓包获取）</label>
+  <div class="hint">登录网页版后 F12 → 网络 → 任意请求 → 请求头 Authorization，<b>去掉开头的 Basic 空格</b> 后粘贴</div>
+  <textarea id="auth" placeholder="cGM6MTM4... 只填 Basic 后面那串 Base64"></textarea>
+  <div id="authState" class="hint"></div>
+
+  <div class="row">
+    <div style="flex:1;min-width:150px">
+      <label>云类型</label>
+      <select id="cloudType">
+        <option value="personal_new">新版个人云（推荐）</option>
+        <option value="personal">旧版个人云</option>
+        <option value="family">家庭云</option>
+        <option value="group">群组云</option>
+      </select>
+    </div>
+    <div style="flex:1;min-width:150px">
+      <label>最小文件大小(MB)</label>
+      <input id="minSize" type="number" value="0" min="0">
+    </div>
+  </div>
+
+  <label>139 邮箱 Cookie（可选，免抓包登录用）</label>
+  <div class="hint">留空即可。若使用，需登录 mail.10086.cn 后复制完整 Cookie（含 Os_SSo_Sid 与 RMKEY）</div>
+  <textarea id="cookies" placeholder="可留空"></textarea>
+  <div class="row">
+    <div style="flex:1;min-width:140px">
+      <label>手机号（配合 Cookie 登录）</label>
+      <input id="username" placeholder="可留空">
+    </div>
+    <div style="flex:1;min-width:140px">
+      <label>群组 ID（仅群组云需要）</label>
+      <input id="cloudId" placeholder="可留空">
+    </div>
+  </div>
+
+  <button onclick="save()">保存配置</button>
+  <button class="ok" onclick="testConn()">测试连接</button>
+  <div id="cfgMsg" class="msg"></div>
+</div>
+
+<!-- 生成 -->
+<div class="card">
+  <h2>2. 生成 STRM</h2>
+  <label>STRM 输出目录（容器内路径）</label>
+  <input id="outputDir" value="/strm">
+  <div class="hint">该目录需要同时挂载给 Emby / Jellyfin，两边路径保持一致</div>
+
+  <label>访问地址（写入 strm 里的地址）</label>
+  <input id="baseUrl" placeholder="留空自动使用当前访问地址，如 http://192.168.1.10:8025">
+  <div class="hint">Emby 将通过此地址访问本项目，必须是播放器能连通的地址</div>
+
+  <label>媒体后缀（逗号分隔）</label>
+  <input id="mediaExt" value="mp4,mkv,avi,mov,wmv,flv,webm,m4v,ts,rmvb,iso">
+
+  <label>附带下载的后缀（字幕等，逗号分隔）</label>
+  <input id="copyExt" value="srt,ass,ssa,sub,vtt,nfo">
+
+  <div class="row" style="margin-top:10px">
+    <label style="margin:0"><input type="checkbox" id="recursive" checked style="width:auto;margin-right:6px">递归子目录</label>
+    <label style="margin:0"><input type="checkbox" id="casEnabled" checked style="width:auto;margin-right:6px">生成 .cas 秒传文件的 STRM</label>
+  </div>
+  <div class="hint">.cas 只有几百字节，是真实文件的"特征码"。勾选后照常生成 strm，播放时服务端会临时秒传还原出真文件再跳转，播完自动删掉临时文件。</div>
+
+  <div style="margin-top:14px">
+    <button class="sec" onclick="pickFolder()">浏览云盘目录</button>
+    <button class="ok" onclick="generate()">开始生成</button>
+    <span id="taskPill"></span>
+  </div>
+  <div id="genMsg" class="msg"></div>
+  <div id="logBox"></div>
+</div>
+
+<!-- CAS -->
+<div class="card">
+  <h2>CAS 秒传播放 <span class="badge" id="casPill"></span></h2>
+  <div class="row">
+    <div style="flex:1">
+      <label>临时文件保留时长（秒）</label>
+      <input id="casTtl" type="number" value="300">
+    </div>
+    <div style="flex:1">
+      <label style="margin:0"><input type="checkbox" id="casAllExt" style="width:auto;margin-right:6px">还原所有类型（不限视频）</label>
+    </div>
+  </div>
+  <div class="hint">播放器拿到 302 后才会真正开始拉流，所以要预留一点时间再删临时文件。拖动进度条不会重复还原（直链已缓存）。</div>
+  <div style="margin-top:10px">
+    <button class="sec" onclick="purgeCas()">立即清空残留临时文件</button>
+    <button onclick="saveCas()">保存 CAS 设置</button>
+  </div>
+  <div id="casMsg" class="msg"></div>
+</div>
+
+<!-- 浏览器 -->
+<div class="card" id="browserCard" style="display:none">
+  <h2>3. 选择要生成的目录 <span class="badge">点击文件夹进入，选好后点「用这个目录」</span></h2>
+  <div id="crumb" class="hint"></div>
+  <div id="fileList"></div>
+  <button class="ok" onclick="useFolder()">用这个目录</button>
+</div>
+
+<div class="card">
+  <h2>使用说明</h2>
+  <ol style="margin-left:20px;font-size:13.5px;line-height:1.9">
+    <li>填入 Authorization 并测试连接</li>
+    <li>设置输出目录（需与 Emby 挂载同一个目录）</li>
+    <li>生成 STRM，等待任务完成</li>
+    <li>Emby 添加媒体库，扫描该目录即可入库</li>
+    <li>播放时 Emby 请求本项目 /d/ 地址，服务端 302 跳到移动云盘直链，<b>视频流不经过本机</b></li>
+  </ol>
+</div>
+
+</div>
+
+<script>
+let currentFolder = "/";
+let stack = [{id:"/", name:"根目录"}];
+
+function show(id, text, cls){
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = "msg show " + (cls||"info");
+}
+function hide(id){ document.getElementById(id).className = "msg"; }
+
+async function load(){
+  const r = await fetch("/api/config").then(x=>x.json());
+  if(r.cloud_type) document.getElementById("cloudType").value = r.cloud_type;
+  if(r.output_dir) document.getElementById("outputDir").value = r.output_dir;
+  if(r.base_url) document.getElementById("baseUrl").value = r.base_url;
+  if(r.media_ext) document.getElementById("mediaExt").value = r.media_ext.join(",");
+  if(r.copy_ext) document.getElementById("copyExt").value = r.copy_ext.join(",");
+  document.getElementById("minSize").value = r.min_size_mb || 0;
+  document.getElementById("cloudId").value = r.cloud_id || "";
+  document.getElementById("username").value = r.username || "";
+  document.getElementById("authState").textContent =
+    r.configured ? ("已保存凭据：" + r.authorization_masked) : "尚未配置";
+  if(r.configured) document.getElementById("auth").placeholder = "已保存，留空则不修改";
+  document.getElementById("casEnabled").checked = r.cas_enabled !== false;
+  document.getElementById("casTtl").value = r.cas_temp_ttl || 300;
+  document.getElementById("casAllExt").checked = !!r.cas_allow_all_ext;
+  loadCasStatus();
+}
+
+async function loadCasStatus(){
+  try{
+    const r = await fetch("/api/cas/status").then(x=>x.json());
+    const pill = document.getElementById("casPill");
+    if(r.ok){
+      pill.textContent = r.enabled
+        ? ("已启用 · 待清理 " + r.pending_cleanup + " 个")
+        : "已关闭";
+    }
+  }catch(e){}
+}
+
+async function saveCas(){
+  const body = {
+    cas_enabled: document.getElementById("casEnabled").checked,
+    cas_temp_ttl: parseInt(document.getElementById("casTtl").value||300),
+    cas_allow_all_ext: document.getElementById("casAllExt").checked,
+  };
+  const r = await fetch("/api/config", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)}).then(x=>x.json());
+  show("casMsg", r.ok ? "CAS 设置已保存" : ("保存失败："+r.error), r.ok?"ok":"err");
+  if(r.ok) loadCasStatus();
+}
+
+async function purgeCas(){
+  show("casMsg","正在清空…","info");
+  const r = await fetch("/api/cas/purge", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"}).then(x=>x.json());
+  show("casMsg", r.ok ? ("已清理 "+r.deleted+" 个残留临时文件") : ("清理失败："+r.error), r.ok?"ok":"err");
+  if(r.ok) loadCasStatus();
+}
+
+async function save(){
+  const body = {
+    cloud_type: document.getElementById("cloudType").value,
+    output_dir: document.getElementById("outputDir").value,
+    base_url: document.getElementById("baseUrl").value,
+    media_ext: document.getElementById("mediaExt").value,
+    copy_ext: document.getElementById("copyExt").value,
+    min_size_mb: parseFloat(document.getElementById("minSize").value||0),
+    username: document.getElementById("username").value,
+    cloud_id: document.getElementById("cloudId").value,
+    mail_cookies: document.getElementById("cookies").value,
+    cas_enabled: document.getElementById("casEnabled").checked,
+  };
+  const auth = document.getElementById("auth").value.trim();
+  if(auth) body.authorization = auth;
+  const r = await fetch("/api/config", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)}).then(x=>x.json());
+  show("cfgMsg", r.ok ? "配置已保存" : ("保存失败："+r.error), r.ok?"ok":"err");
+  load();
+}
+
+async function testConn(){
+  show("cfgMsg","正在连接移动云盘…","info");
+  const body = {cloud_type: document.getElementById("cloudType").value};
+  const auth = document.getElementById("auth").value.trim();
+  if(auth) body.authorization = auth;
+  const r = await fetch("/api/test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(x=>x.json());
+  if(r.ok){
+    show("cfgMsg", `连接成功！账号 ${r.account}，根目录 ${r.root_items} 个条目，凭据有效期至 ${r.expire||"未知"}`, "ok");
+  } else {
+    show("cfgMsg", "连接失败：" + r.error, "err");
+  }
+}
+
+async function pickFolder(){
+  document.getElementById("browserCard").style.display = "block";
+  document.getElementById("browserCard").scrollIntoView({behavior:"smooth"});
+  browse("/");
+}
+
+async function browse(folder, push){
+  const r = await fetch("/api/list?folder="+encodeURIComponent(folder)).then(x=>x.json());
+  if(!r.ok){ alert("列出失败："+r.error); return; }
+  if(push) stack.push({id:folder, name:push});
+  currentFolder = folder;
+  document.getElementById("crumb").textContent = "当前：" + stack.map(s=>s.name).join(" / ");
+  let html = `<table><tr><th>名称</th><th>类型</th><th>大小</th></tr>`;
+  r.items.forEach(it=>{
+    const size = it.is_folder ? "-" : (it.size/1048576).toFixed(1)+" MB";
+    if(it.is_folder){
+      html += `<tr><td class="dir" onclick="browse('${it.file_id}','${it.name.replace(/'/g,"")}')">📁 ${it.name}</td><td>目录</td><td>${size}</td></tr>`;
+    } else {
+      html += `<tr><td>${it.name}</td><td>文件</td><td>${size}</td></tr>`;
+    }
+  });
+  html += "</table>";
+  document.getElementById("fileList").innerHTML = html;
+}
+
+function useFolder(){
+  show("genMsg", "已选择目录：" + stack.map(s=>s.name).join(" / ") + "（点击「开始生成」）", "ok");
+}
+
+async function generate(){
+  const body = {
+    folder: currentFolder,
+    output_dir: document.getElementById("outputDir").value,
+    base_url: document.getElementById("baseUrl").value,
+    media_ext: document.getElementById("mediaExt").value.split(",").map(s=>s.trim()).filter(Boolean),
+    copy_ext: document.getElementById("copyExt").value.split(",").map(s=>s.trim()).filter(Boolean),
+    min_size_mb: parseFloat(document.getElementById("minSize").value||0),
+    recursive: document.getElementById("recursive").checked,
+  };
+  const r = await fetch("/api/strm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(x=>x.json());
+  if(!r.ok){ show("genMsg", r.error, "err"); return; }
+  show("genMsg","任务已启动，正在扫描…","info");
+  poll();
+}
+
+async function poll(){
+  const r = await fetch("/api/strm/status").then(x=>x.json());
+  document.getElementById("taskPill").innerHTML =
+    r.running ? `<span class="pill p-run">${r.progress}</span>`
+              : (r.result?`<span class="pill p-ok">完成</span>`:"");
+  if(r.running){ setTimeout(poll, 1500); return; }
+  if(r.result){
+    const s = r.result;
+    show("genMsg", `完成：新建 ${s.created} 个 strm，跳过 ${s.skipped} 个，下载附属文件 ${s.copied} 个` +
+      (s.errors && s.errors.length ? `，${s.errors.length} 个错误` : ""), s.errors&&s.errors.length?"err":"ok");
+    let html = "<pre class='log'>";
+    (s.logs||[]).forEach(l=> html += l.replace(/</g,"&lt;") + "\n");
+    if(s.errors && s.errors.length){ html += "\n--- 错误 ---\n"; s.errors.forEach(e=> html += e + "\n"); }
+    html += "</pre>";
+    document.getElementById("logBox").innerHTML = html;
+  }
+}
+
+load();
+</script>
+</body>
+</html>
