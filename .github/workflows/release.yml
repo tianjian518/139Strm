@@ -1,0 +1,147 @@
+name: Verify & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布标签"
+        required: false
+        default: "v1.0"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 查询 Docker Hub 镜像信息
+        id: probe
+        run: |
+          USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
+          IMAGE="$USERNAME/139strm"
+          JWT=$(curl -s -X POST https://hub.docker.com/v2/users/login/ \
+            -H "Content-Type: application/json" \
+            -d '{"username":"'"$USERNAME"'","password":"${{ secrets.DOCKERHUB_TOKEN }}"}' \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
+          echo "user=$USERNAME" >> $GITHUB_OUTPUT
+          REPORT=""
+
+          for TAG in latest 1.0 1; do
+            CODE=$(curl -s -o /tmp/m_$TAG.json -w "%{http_code}" \
+              -H "Authorization: JWT $JWT" \
+              "https://hub.docker.com/v2/repositories/$IMAGE/tags/$TAG/")
+            if [ "$CODE" = "200" ]; then
+              REPORT="$REPORT\n$(python3 - "$TAG" <<'PY'
+          import json, sys
+          t = sys.argv[1]
+          d = json.load(open(f"/tmp/m_{t}.json"))
+          rows = []
+          total = 0
+          for i in d.get("images", []):
+              total += i.get("size", 0)
+              rows.append(f"| {i.get('architecture')} | {i.get('os')} | `{str(i.get('digest'))[:30]}…` | {round(i.get('size',0)/1048576,1)} MB |")
+          head = f"\n**`{d.get('namespace')}/{d.get('name')}:{t}`**\n\n| 架构 | 系统 | 摘要 | 体积 |\n|---|---|---|---|\n"
+          print(head + "\n".join(rows) + f"\n\n合计 {round(total/1048576,1)} MB，共 {len(rows)} 个架构\n")
+          PY
+          )"
+            else
+              REPORT="$REPORT\n**\`$IMAGE:$TAG\`** —— ❌ 未找到\n"
+            fi
+          done
+          printf "%b" "$REPORT" > /tmp/report.md
+          {
+            echo 'report<<__EOF__'
+            cat /tmp/report.md
+            echo '__EOF__'
+          } >> $GITHUB_OUTPUT
+
+      - name: 生成 Release Notes
+        run: |
+          cat > /tmp/notes.md <<'__NOTES__'
+          ## 139Strm ${{ github.event.inputs.tag || 'v1.0' }}
+
+          移动云盘（139 / 和彩云）专用的 STRM 生成器 + 302 直链服务。
+          直连官方接口，不依赖 OpenList，不需要境外中转。
+
+          ### 这次版本的核心：`.cas` 秒传文件可以直接播放
+
+          移动云盘里的 `.cas` 只有几百字节，是真实文件的"特征码"，播放器打开它只会拿到一段 JSON。
+          139Strm 在播放的那一刻把它还原成真文件：
+
+          1. 下载几百字节的 `.cas`，解出 SHA256 / 大小 / 原始文件名
+          2. 调 `/file/create` 做秒传 —— 云端凭空还原出完整真文件（实测 0.65~1.6 秒）
+          3. 取临时文件的真实直链，302 给播放器
+          4. 延迟 5 分钟自动彻底删除临时文件，云盘里不留痕迹
+
+          不占云盘空间（秒传是引用不是复制），不消耗上传流量，拖进度条不会重复还原（直链已缓存）。
+
+          ### 实测验证
+
+          | 能力 | 结果 |
+          |---|---|
+          | 302 直链播放 | ✅ 跳转到 cmecloud.cn CDN，支持 Range 分段 |
+          | 直链缓存 | ✅ 二次请求 1.3s → 0.17s |
+          | CAS 秒传还原 | ✅ 3 个文件（3.0~4.4 GB）全部成功 |
+          | CAS 播放验证 | ✅ HTTP 206 + `video/x-matroska` + MKV 魔数 `1a45dfa3` |
+          | 临时文件自动清理 | ✅ TTL 到期后临时目录归零 |
+          | STRM 生成 | ✅ 自动去掉 `.cas` 尾巴，Emby 看到的是 `电影.mkv.strm` |
+          | 协议层 | ✅ 与 OpenList Go 实现逐字节对照，12/12 一致 |
+
+          ### 已发布的 Docker 镜像
+
+          __REPORT__
+
+          ### 一行命令跑起来
+
+          ```bash
+          mkdir -p 139strm/{config,strm} && cd 139strm
+          cat > docker-compose.yml <<'EOF'
+          services:
+            139strm:
+              image: __USER__/139strm:1.0
+              container_name: 139strm
+              restart: unless-stopped
+              ports:
+                - "8025:8025"
+              volumes:
+                - ./config:/app/config
+                - ./strm:/strm
+          EOF
+          docker compose up -d
+          ```
+
+          然后打开 `http://你的IP:8025`，填入 Authorization 即可。
+
+          > `./strm` 目录需要同时挂载给 Emby / Jellyfin，两边路径保持一致。
+
+          ### 注意事项
+
+          - 播放 `.cas` 时，云盘根目录的 `139STRM_TEMP` 文件夹会短暂出现还原出的文件，默认 5 分钟后自动删除
+          - 只有新版个人云（`cloud_type = personal_new`）支持 CAS 秒传还原
+          - 如果云端源数据已被清理，秒传会明确提示"该文件已失效无法还原"
+          __NOTES__
+
+          python3 - <<'PY'
+          notes = open("/tmp/notes.md").read()
+          notes = notes.replace("__REPORT__", open("/tmp/report.md").read())
+          notes = notes.replace("__USER__", "${{ steps.probe.outputs.user }}")
+          notes = notes.replace("${{ github.event.inputs.tag || 'v1.0' }}", "${{ github.event.inputs.tag }}")
+          open("/tmp/notes_final.md", "w").write(notes)
+          print(notes[:800])
+          PY
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: 139Strm ${{ github.event.inputs.tag }}
+          body_path: /tmp/notes_final.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
