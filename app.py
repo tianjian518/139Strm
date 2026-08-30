@@ -42,6 +42,13 @@ _task_state = {
 }
 _task_lock = threading.Lock()
 
+# 定时同步运行状态（与单次手动任务分开记录）
+_schedule_meta = {
+    "last_run_at": None,
+    "last_result": None,
+    "next_run_at": None,
+}
+
 
 # ----------------------------------------------------------------------
 # 配置
@@ -64,6 +71,16 @@ DEFAULT_CONFIG = {
     "cas_temp_ttl": 300,       # 还原出的临时文件保留秒数后自动删除
     "cas_allow_all_ext": False,  # False=只还原视频；True=任何后缀都还原
     "cas_temp_dir_id": "",     # 记住临时目录 ID，避免重启后重复创建
+    # ---- 同步模式 ----
+    "sync_mode": "incremental",  # incremental=跳过已生成；force=全量覆盖重新生成
+    # ---- 定时同步 ----
+    "schedule_enabled": False,
+    "schedule_kind": "off",       # off / daily / interval
+    "schedule_hour": 3,
+    "schedule_minute": 0,
+    "schedule_interval_hours": 6,
+    "schedule_folder": "/",
+    "schedule_sync_mode": "incremental",
 }
 
 
@@ -265,6 +282,39 @@ def api_list():
 # STRM 生成
 # ----------------------------------------------------------------------
 
+def run_strm_job(cfg, folder, force, fallback_host, delete_orphans=False):
+    """
+    真正执行一次 STRM 生成（手动或定时都会走到这里）。
+
+    返回 summary 字典；任何异常都被包成 summary，不会向外抛，避免后台线程静默崩溃。
+    """
+    try:
+        client = build_client(cfg)
+        client.init()
+        base_url = get_base_url(cfg, fallback_host)
+        if not base_url:
+            raise ValueError(
+                "无法确定访问地址，请在配置中填写 base_url（如 http://192.168.1.10:8025）"
+            )
+        gen = StrmGenerator(
+            client=client, base_url=base_url,
+            output_dir=cfg.get("output_dir") or "/strm",
+            media_ext=cfg.get("media_ext"), copy_ext=cfg.get("copy_ext"),
+            min_size_mb=float(cfg.get("min_size_mb", 0) or 0),
+            recursive=bool(cfg.get("recursive", True)),
+            include_cas=bool(cfg.get("cas_enabled", True)),
+            force=bool(force),
+            delete_orphans=bool(delete_orphans),
+        )
+        gen.generate(folder, "")
+        gen.clean_orphans()
+        return gen.summary()
+    except Exception as exc:
+        return {"errors": [f"{type(exc).__name__}: {exc}"],
+                "created": 0, "updated": 0, "skipped": 0,
+                "copied": 0, "logs": []}
+
+
 @app.route("/api/strm", methods=["POST"])
 def api_strm():
     data = request.get_json(force=True) or {}
@@ -279,13 +329,15 @@ def api_strm():
         })
 
     folder = data.get("folder", "/")
-    output_dir = data.get("output_dir") or cfg.get("output_dir") or "/strm"
-    media_ext = data.get("media_ext") or cfg.get("media_ext")
-    copy_ext = data.get("copy_ext") or cfg.get("copy_ext")
-    min_size = data.get("min_size_mb", cfg.get("min_size_mb", 0))
-    recursive = data.get("recursive", cfg.get("recursive", True))
     if data.get("base_url"):
         cfg["base_url"] = data["base_url"]
+    sync_mode = data.get("sync_mode") or cfg.get("sync_mode") or "incremental"
+    force = sync_mode == "force"
+    # 强同步默认开启删除孤儿；若请求显式带 delete_orphans 则尊重之
+    if "delete_orphans" in data:
+        delete_orphans = bool(data.get("delete_orphans"))
+    else:
+        delete_orphans = force
 
     # 在主线程取好 host，后台线程取不到 request
     fallback_host = request.host_url.rstrip("/")
@@ -294,33 +346,10 @@ def api_strm():
         try:
             with _task_lock:
                 _task_state["progress"] = "正在连接移动云盘"
-            client = build_client(cfg)
-            client.init()
-
-            base_url = get_base_url(cfg, fallback_host)
-            if not base_url:
-                raise ValueError(
-                    "无法确定访问地址，请在配置中填写 base_url（如 http://192.168.1.10:8025）"
-                )
-            gen = StrmGenerator(
-                client=client, base_url=base_url, output_dir=output_dir,
-                media_ext=media_ext, copy_ext=copy_ext,
-                min_size_mb=float(min_size or 0), recursive=bool(recursive),
-                include_cas=bool(cfg.get("cas_enabled", True)),
-            )
+            summary = run_strm_job(cfg, folder, force, fallback_host, delete_orphans)
             with _task_lock:
-                _task_state["progress"] = "正在扫描目录（可能需要一点时间）"
-            gen.generate(folder, "")
-
-            with _task_lock:
-                _task_state["result"] = gen.summary()
-                _task_state["progress"] = "完成"
-        except Exception as exc:
-            with _task_lock:
-                _task_state["result"] = {"errors": [f"{type(exc).__name__}: {exc}"],
-                                         "created": 0, "skipped": 0,
-                                         "copied": 0, "logs": []}
-                _task_state["progress"] = "失败"
+                _task_state["result"] = summary
+                _task_state["progress"] = "完成" if not summary.get("errors") else "完成（有错误）"
         finally:
             with _task_lock:
                 _task_state["running"] = False
@@ -429,6 +458,82 @@ def api_link(file_id):
 
 
 # ----------------------------------------------------------------------
+# 定时同步调度器（仅用标准库，无额外依赖）
+# ----------------------------------------------------------------------
+
+def _compute_next_run(cfg, now):
+    """计算下一次定时运行的本地时间（无下次则返回 None）。"""
+    from datetime import timedelta
+    kind = cfg.get("schedule_kind")
+    if kind == "daily":
+        try:
+            h = int(cfg.get("schedule_hour") or 3)
+            m = int(cfg.get("schedule_minute") or 0)
+        except (TypeError, ValueError):
+            h, m = 3, 0
+        cand = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if cand <= now:
+            cand += timedelta(days=1)
+        return cand
+    if kind == "interval":
+        try:
+            iv = max(1, int(cfg.get("schedule_interval_hours") or 6))
+        except (TypeError, ValueError):
+            iv = 6
+        last = _schedule_meta.get("last_run_at")
+        if last:
+            try:
+                last_dt = datetime.fromisoformat(last) if isinstance(last, str) else last
+            except (ValueError, TypeError):
+                last_dt = None
+            if last_dt:
+                cand = last_dt + timedelta(hours=iv)
+                return cand if cand > now else now
+        return now
+    return None
+
+
+def _run_scheduled():
+    """触发一次定时生成（与手动任务共用 _task_state，避免并发）。"""
+    with _task_lock:
+        if _task_state["running"]:
+            return
+    cfg = load_config()
+    folder = cfg.get("schedule_folder") or "/"
+    force = (cfg.get("schedule_sync_mode") or "incremental") == "force"
+    # 定时任务的删除孤儿：遵循 schedule_sync_mode；若用户单独设了 schedule_delete_orphans 则尊重之
+    if "schedule_delete_orphans" in cfg:
+        delete_orphans = bool(cfg.get("schedule_delete_orphans"))
+    else:
+        delete_orphans = force
+    # 定时任务没有 HTTP 请求上下文，base_url 必须用配置里填好的那个
+    fallback_host = cfg.get("base_url") or ""
+    summary = run_strm_job(cfg, folder, force, fallback_host, delete_orphans)
+    with _task_lock:
+        _schedule_meta["last_run_at"] = datetime.now().isoformat()
+        _schedule_meta["last_result"] = summary
+    app.logger.info("定时任务完成：%s", summary)
+
+
+def _scheduler_loop():
+    """后台线程：每 15 秒检查一次是否到了运行时间。"""
+    while True:
+        try:
+            time.sleep(15)
+            cfg = load_config()
+            if not cfg.get("schedule_enabled") or cfg.get("schedule_kind") == "off":
+                _schedule_meta["next_run_at"] = None
+                continue
+            now = datetime.now()
+            nxt = _compute_next_run(cfg, now)
+            _schedule_meta["next_run_at"] = nxt.isoformat() if nxt else None
+            if nxt and now >= nxt:
+                _run_scheduled()
+        except Exception as exc:
+            app.logger.warning("定时调度器异常: %s", exc)
+
+
+# ----------------------------------------------------------------------
 # CAS 临时文件管理
 # ----------------------------------------------------------------------
 
@@ -462,6 +567,68 @@ def api_cas_purge():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+# ----------------------------------------------------------------------
+# 定时同步接口
+# ----------------------------------------------------------------------
+
+@app.route("/api/schedule", methods=["GET"])
+def api_get_schedule():
+    cfg = load_config()
+    enabled = bool(cfg.get("schedule_enabled")) and cfg.get("schedule_kind") not in (None, "off")
+    nxt = _compute_next_run(cfg, datetime.now()) if enabled else None
+    return jsonify({
+        "ok": True,
+        "enabled": bool(cfg.get("schedule_enabled")),
+        "kind": cfg.get("schedule_kind", "off"),
+        "hour": cfg.get("schedule_hour", 3),
+        "minute": cfg.get("schedule_minute", 0),
+        "interval_hours": cfg.get("schedule_interval_hours", 6),
+        "folder": cfg.get("schedule_folder", "/"),
+        "sync_mode": cfg.get("schedule_sync_mode", "incremental"),
+        "last_run_at": _schedule_meta.get("last_run_at"),
+        "last_result": _schedule_meta.get("last_result"),
+        "next_run_at": nxt.isoformat() if nxt else None,
+        "running": _task_state["running"],
+    })
+
+
+@app.route("/api/schedule", methods=["POST"])
+def api_save_schedule():
+    cfg = load_config()
+    data = request.get_json(force=True) or {}
+    for key in ("schedule_enabled", "schedule_kind", "schedule_hour",
+                "schedule_minute", "schedule_interval_hours",
+                "schedule_folder", "schedule_sync_mode"):
+        if key not in data:
+            continue
+        val = data[key]
+        if key == "schedule_enabled":
+            val = bool(val)
+        elif key == "schedule_kind":
+            val = val if val in ("off", "daily", "interval") else "off"
+        elif key == "schedule_sync_mode":
+            val = val if val in ("incremental", "force") else "incremental"
+        elif key in ("schedule_hour", "schedule_minute", "schedule_interval_hours"):
+            try:
+                val = int(val)
+            except (TypeError, ValueError):
+                continue
+        cfg[key] = val
+    save_config(cfg)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/schedule/now", methods=["POST"])
+def api_run_schedule_now():
+    with _task_lock:
+        if _task_state["running"]:
+            return jsonify({"ok": False, "error": "已有任务正在运行"}), 409
+    threading.Thread(target=_run_scheduled, daemon=True).start()
+    return jsonify({"ok": True, "message": "定时任务已启动"})
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8025))
+    threading.Thread(target=_scheduler_loop, name="139strm-scheduler",
+                     daemon=True).start()
     app.run(host="0.0.0.0", port=port, threaded=True)

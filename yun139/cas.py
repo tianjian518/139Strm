@@ -23,7 +23,24 @@ import random
 import threading
 import time
 
+from yun139.client import Yun139Error
+
 logger = logging.getLogger("139strm.cas")
+
+# 移动云盘接口报这些字眼时，通常是账号「权益」不足（会员等级 / 容量 / 文件大小限制），
+# 与 139Strm 本身无关，代码层面无法绕过，只能升级账号或只还原较小的文件。
+ENTITLEMENT_KEYWORDS = (
+    "权益", "不足", "超限", "容量", "过大", "entitlement", "quota",
+)
+
+
+def _fmt_size(size):
+    """把字节数转成人类可读的大小。"""
+    if size >= GB:
+        return "%.2f GB" % (size / GB)
+    if size >= MB:
+        return "%.1f MB" % (size / MB)
+    return "%d 字节" % size
 
 # 临时还原目录名，放在个人云根目录
 TEMP_DIR_NAME = "139STRM_TEMP"
@@ -273,7 +290,18 @@ class CASRestorer:
             "type": "file",
             "fileRenameMode": "auto_rename",
         }
-        resp = self.client.personal_create(payload, use_pc_headers=True)
+        try:
+            resp = self.client.personal_create(payload, use_pc_headers=True)
+        except Yun139Error as exc:
+            msg = str(exc)
+            if any(k in msg for k in ENTITLEMENT_KEYWORDS):
+                # 移动云盘账号权益（会员等级 / 文件大小上限）不足，代码无法绕过
+                raise CASError(
+                    "账号秒传权益不足，无法还原大小约 %s 的文件（%s）。"
+                    "这是移动云盘账号等级限制，与 139Strm 无关；"
+                    "请升级移动云盘会员，或只播放较小的 CAS 文件。" % (_fmt_size(size), msg)
+                ) from exc
+            raise
         data = resp.get("data") or {}
         if not data.get("exist") and not data.get("rapidUpload") \
                 and data.get("partInfos") is not None:

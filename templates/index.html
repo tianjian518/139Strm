@@ -118,6 +118,17 @@ pre.log{background:#1e2229;color:#d6d6d6;padding:12px;border-radius:8px;font-siz
   </div>
   <div class="hint">.cas 只有几百字节，是真实文件的"特征码"。勾选后照常生成 strm，播放时服务端会临时秒传还原出真文件再跳转，播完自动删掉临时文件。</div>
 
+  <div class="row" style="margin-top:10px">
+    <label style="margin:0"><input type="radio" name="syncMode" value="incremental" checked style="width:auto;margin-right:6px">增量同步（跳过已生成的）</label>
+    <label style="margin:0"><input type="radio" name="syncMode" value="force" style="width:auto;margin-right:6px">强同步（覆盖重新生成）</label>
+  </div>
+  <div class="hint">增量：同名 strm 已存在就跳过，只补新的；强同步：全部重新生成（覆盖旧文件）。</div>
+
+  <div class="row" style="margin-top:8px">
+    <label style="margin:0"><input type="checkbox" id="deleteOrphans" checked style="width:auto;margin-right:6px">同步删除孤儿文件（源头删了，本地 strm 也跟着删）</label>
+  </div>
+  <div class="hint">仅清理本次同步范围内、源头已不存在的 <b>.strm</b>；绝不删字幕 / 图片等附属文件，也不会动其他来源的 strm。建议与「强同步」搭配使用。</div>
+
   <div style="margin-top:14px">
     <button class="sec" onclick="pickFolder()">浏览云盘目录</button>
     <button class="ok" onclick="generate()">开始生成</button>
@@ -147,9 +158,58 @@ pre.log{background:#1e2229;color:#d6d6d6;padding:12px;border-radius:8px;font-siz
   <div id="casMsg" class="msg"></div>
 </div>
 
+<!-- 定时同步 -->
+<div class="card">
+  <h2>定时同步 <span class="badge" id="schPill"></span></h2>
+  <div class="hint">开启后按设定周期自动扫描云盘目录、生成 / 更新 STRM，无需手动点。增量模式只补新文件，强同步模式覆盖重生成。</div>
+
+  <div class="row" style="margin-top:8px">
+    <label style="margin:0"><input type="checkbox" id="schEnabled" style="width:auto;margin-right:6px">启用定时同步</label>
+  </div>
+
+  <label>同步方式</label>
+  <select id="schKind">
+    <option value="off">关闭</option>
+    <option value="daily">每天固定时间</option>
+    <option value="interval">每隔 N 小时</option>
+  </select>
+
+  <div class="row">
+    <div style="flex:1;min-width:160px">
+      <label>每天时间（时 : 分）</label>
+      <div class="row">
+        <input id="schHour" type="number" value="3" min="0" max="23" style="width:70px">
+        <span style="padding:0 4px">:</span>
+        <input id="schMinute" type="number" value="0" min="0" max="59" style="width:70px">
+      </div>
+    </div>
+    <div style="flex:1;min-width:160px">
+      <label>每隔几小时</label>
+      <input id="schInterval" type="number" value="6" min="1">
+    </div>
+  </div>
+
+  <label>同步目录（云盘内路径，默认根目录）</label>
+  <input id="schFolder" value="/">
+  <div class="hint">定时任务无网页请求上下文，必须先在「连接移动云盘」里填好「访问地址(base_url)」，否则会跳过本次运行。</div>
+
+  <label>同步模式</label>
+  <select id="schSyncMode">
+    <option value="incremental">增量（跳过已生成）</option>
+    <option value="force">强同步（覆盖重生成）</option>
+  </select>
+
+  <div style="margin-top:12px">
+    <button class="ok" onclick="saveSchedule()">保存定时设置</button>
+    <button class="sec" onclick="runScheduleNow()">立即运行一次</button>
+  </div>
+  <div id="schMsg" class="msg"></div>
+  <div id="schStatus" class="hint"></div>
+</div>
+
 <!-- 浏览器 -->
 <div class="card" id="browserCard" style="display:none">
-  <h2>3. 选择要生成的目录 <span class="badge">点击文件夹进入，选好后点「用这个目录」</span></h2>
+  <h2>4. 选择要生成的目录 <span class="badge">点击文件夹进入，选好后点「用这个目录」</span></h2>
   <div id="crumb" class="hint"></div>
   <div id="fileList"></div>
   <button class="ok" onclick="useFolder()">用这个目录</button>
@@ -196,6 +256,7 @@ async function load(){
   document.getElementById("casTtl").value = r.cas_temp_ttl || 300;
   document.getElementById("casAllExt").checked = !!r.cas_allow_all_ext;
   loadCasStatus();
+  loadSchedule();
 }
 
 async function loadCasStatus(){
@@ -299,6 +360,8 @@ async function generate(){
     copy_ext: document.getElementById("copyExt").value.split(",").map(s=>s.trim()).filter(Boolean),
     min_size_mb: parseFloat(document.getElementById("minSize").value||0),
     recursive: document.getElementById("recursive").checked,
+    sync_mode: document.querySelector('input[name="syncMode"]:checked').value,
+    delete_orphans: document.getElementById("deleteOrphans").checked,
   };
   const r = await fetch("/api/strm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(x=>x.json());
   if(!r.ok){ show("genMsg", r.error, "err"); return; }
@@ -314,7 +377,7 @@ async function poll(){
   if(r.running){ setTimeout(poll, 1500); return; }
   if(r.result){
     const s = r.result;
-    show("genMsg", `完成：新建 ${s.created} 个 strm，跳过 ${s.skipped} 个，下载附属文件 ${s.copied} 个` +
+    show("genMsg", `完成：新建 ${s.created} 个、更新 ${s.updated||0} 个、跳过 ${s.skipped} 个、删除孤儿 ${s.deleted||0} 个、下载附属 ${s.copied} 个` +
       (s.errors && s.errors.length ? `，${s.errors.length} 个错误` : ""), s.errors&&s.errors.length?"err":"ok");
     let html = "<pre class='log'>";
     (s.logs||[]).forEach(l=> html += l.replace(/</g,"&lt;") + "\n");
@@ -322,6 +385,61 @@ async function poll(){
     html += "</pre>";
     document.getElementById("logBox").innerHTML = html;
   }
+}
+
+// ---- 定时同步 ----
+async function loadSchedule(){
+  try{
+    const r = await fetch("/api/schedule").then(x=>x.json());
+    document.getElementById("schEnabled").checked = !!r.enabled;
+    document.getElementById("schKind").value = r.kind || "off";
+    document.getElementById("schHour").value = (r.hour ?? 3);
+    document.getElementById("schMinute").value = (r.minute ?? 0);
+    document.getElementById("schInterval").value = (r.interval_hours ?? 6);
+    document.getElementById("schFolder").value = r.folder || "/";
+    document.getElementById("schSyncMode").value = r.sync_mode || "incremental";
+    renderSchStatus(r);
+  }catch(e){}
+}
+
+function renderSchStatus(r){
+  if(r.enabled && r.kind && r.kind!=="off"){
+    document.getElementById("schPill").textContent = r.running ? "运行中" : "已启用";
+    let s = "上次运行：" + (r.last_run_at ? r.last_run_at : "暂无");
+    if(r.next_run_at) s += " ｜ 下次运行：" + r.next_run_at;
+    document.getElementById("schStatus").textContent = s;
+  } else {
+    document.getElementById("schPill").textContent = "未启用";
+    document.getElementById("schStatus").textContent = "";
+  }
+}
+
+async function saveSchedule(){
+  const body = {
+    schedule_enabled: document.getElementById("schEnabled").checked,
+    schedule_kind: document.getElementById("schKind").value,
+    schedule_hour: parseInt(document.getElementById("schHour").value||3),
+    schedule_minute: parseInt(document.getElementById("schMinute").value||0),
+    schedule_interval_hours: parseInt(document.getElementById("schInterval").value||6),
+    schedule_folder: document.getElementById("schFolder").value || "/",
+    schedule_sync_mode: document.getElementById("schSyncMode").value,
+  };
+  const r = await fetch("/api/schedule",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(x=>x.json());
+  show("schMsg", r.ok ? "定时设置已保存" : ("保存失败："+(r.error||"")), r.ok?"ok":"err");
+  if(r.ok){ loadSchedule(); pollSchedule(); }
+}
+
+async function runScheduleNow(){
+  const r = await fetch("/api/schedule/now",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(x=>x.json());
+  if(!r.ok){ show("schMsg", r.error||"启动失败", "err"); return; }
+  show("schMsg","定时任务已启动…","info");
+  pollSchedule();
+}
+
+async function pollSchedule(){
+  const r = await fetch("/api/schedule").then(x=>x.json());
+  renderSchStatus(r);
+  if(r.running){ setTimeout(pollSchedule, 1500); }
 }
 
 load();
