@@ -1,0 +1,51 @@
+# ============================================================
+# 甲骨文 ARM 实例内部部署（无公网端口、全走内网）
+# 用 host 网络，让飞牛经「实例私有 IP」直接访问 139Strm
+# base_url 请填：http://<本实例私有IP, 10.x.x.x>:8025
+# ============================================================
+name: 139strm
+services:
+  139strm:
+    image: tianjian518/139strm:1.1.0
+    container_name: 139strm
+    network_mode: host            # 关键：host 网络，直接监听宿主机，飞牛用私有IP即可访问
+    restart: unless-stopped
+    volumes:
+      - ./config:/app/config      # 配置与凭据持久化
+      - ./strm:/strm              # 生成的 strm 目录，飞牛也挂载这个
+    environment:
+      - PORT=8025
+      - CONFIG_PATH=/app/config/config.json
+      - YUN139_OUTPUT_DIR=/strm
+      - TZ=Asia/Shanghai
+      # 可选：直接通过环境变量注入凭据，优先级高于界面配置
+      # - YUN139_AUTHORIZATION=
+      # - YUN139_CLOUD_TYPE=personal_new
+
+# ------------------------------------------------------------
+# 备选「完全免 IP」方案（需飞牛也跑在 Docker 里）：
+# 不用 host 网络，改用自定义网络 + 容器名互访。
+# 把下面这份替上去，并让飞牛容器也加同一个 networks: [media]，
+# 然后 base_url 填 http://139strm:8025 即可（Docker 内部 DNS 解析容器名）。
+# ------------------------------------------------------------
+# name: 139strm
+# services:
+#   139strm:
+#     image: tianjian518/139strm:1.1.0
+#     container_name: 139strm
+#     restart: unless-stopped
+#     ports:
+#       - "8025:8025"
+#     volumes:
+#       - ./config:/app/config
+#       - ./strm:/strm
+#     environment:
+#       - PORT=8025
+#       - CONFIG_PATH=/app/config/config.json
+#       - YUN139_OUTPUT_DIR=/strm
+#       - TZ=Asia/Shanghai
+#     networks:
+#       - media
+# networks:
+#   media:
+#     name: media

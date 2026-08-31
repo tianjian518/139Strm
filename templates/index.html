@@ -24,6 +24,8 @@ button:hover{filter:brightness(1.08)}
 button:disabled{background:#9ca3af;cursor:not-allowed}
 button.sec{background:#6b7280}
 button.ok{background:var(--ok)}
+button.danger{background:var(--bad)}
+button.sm{margin-top:0;padding:5px 12px;font-size:13px}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .msg{margin-top:12px;padding:10px 14px;border-radius:8px;font-size:13.5px;display:none}
 .msg.show{display:block}
@@ -41,6 +43,7 @@ th{background:#f3f5f9}
 .p-run{background:#fff0dd;color:#a36208}
 .badge{float:right;font-size:12px;color:var(--sub);font-weight:400}
 pre.log{background:#1e2229;color:#d6d6d6;padding:12px;border-radius:8px;font-size:12px;max-height:260px;overflow:auto;margin-top:10px}
+.task-ops{display:flex;gap:6px;flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -95,9 +98,24 @@ pre.log{background:#1e2229;color:#d6d6d6;padding:12px;border-radius:8px;font-siz
   <div id="cfgMsg" class="msg"></div>
 </div>
 
-<!-- 生成 -->
+<!-- 任务管理 -->
 <div class="card">
-  <h2>2. 生成 STRM</h2>
+  <h2>2. 任务管理 <span class="badge" id="taskCount"></span></h2>
+  <div class="hint">每个任务绑定一个云盘目录。新建任务选新目录，各任务互不影响；不想要的任务可删除（可一并清理它生成的 strm 目录）。推荐用任务来组织不同目录。</div>
+  <div id="taskList"></div>
+  <div style="margin-top:12px">
+    <button class="ok" onclick="newTask()">+ 新建任务</button>
+    <button class="sec" onclick="runAllTasks()">运行全部已启用</button>
+    <span id="runAllPill"></span>
+    <button id="stopBtn" style="display:none;background:#c0392b;color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;margin-left:8px" onclick="stopTasks()">⛔ 强制终止</button>
+  </div>
+  <div id="taskMsg" class="msg"></div>
+</div>
+
+<!-- 生成（一次性，不保存为任务） -->
+<div class="card">
+  <h2>3. 临时生成 <span class="badge">不保存，用完即弃</span></h2>
+  <div class="hint">适合临时生成一次、不想建任务的场景。浏览选目录后直接生成，行为与任务一致，但不会出现在任务列表里。</div>
   <label>STRM 输出目录（容器内路径）</label>
   <input id="outputDir" value="/strm">
   <div class="hint">该目录需要同时挂载给 Emby / Jellyfin，两边路径保持一致</div>
@@ -129,13 +147,46 @@ pre.log{background:#1e2229;color:#d6d6d6;padding:12px;border-radius:8px;font-siz
   </div>
   <div class="hint">仅清理本次同步范围内、源头已不存在的 <b>.strm</b>；绝不删字幕 / 图片等附属文件，也不会动其他来源的 strm。建议与「强同步」搭配使用。</div>
 
+  <div class="row" style="margin-top:8px">
+    <label style="margin:0"><input type="checkbox" id="keepRoot" checked style="width:auto;margin-right:6px">在输出目录保留"选定目录"这一层（推荐）</label>
+  </div>
+  <div class="hint">勾选后，选 <b>/电影</b> 会生成 <b>/strm/电影/…</b> 的清晰结构；不勾则文件直接散在输出根目录（选根目录时此选项无效，始终不套壳）。</div>
+
   <div style="margin-top:14px">
-    <button class="sec" onclick="pickFolder()">浏览云盘目录</button>
+    <button class="sec" onclick="pickFolder('adhoc')">浏览云盘目录</button>
     <button class="ok" onclick="generate()">开始生成</button>
     <span id="taskPill"></span>
   </div>
   <div id="genMsg" class="msg"></div>
   <div id="logBox"></div>
+</div>
+
+<!-- 任务编辑（隐藏） -->
+<div class="card" id="taskEditCard" style="display:none">
+  <h2 id="taskEditTitle">新建任务</h2>
+  <label>任务名称</label>
+  <input id="teName" placeholder="例如：我的电影">
+  <label>已选目录</label>
+  <input id="teFolderDisplay" readonly style="background:#f3f5f9">
+  <div class="row" style="margin-top:10px">
+    <label style="margin:0"><input type="radio" name="teSyncMode" value="incremental" checked style="width:auto;margin-right:6px">增量同步</label>
+    <label style="margin:0"><input type="radio" name="teSyncMode" value="force" style="width:auto;margin-right:6px">强同步</label>
+  </div>
+  <div class="hint">增量：只补新文件；强同步：覆盖重生成全部 strm。</div>
+  <div class="row" style="margin-top:8px">
+    <label style="margin:0"><input type="checkbox" id="teRecursive" checked style="width:auto;margin-right:6px">递归子目录</label>
+    <label style="margin:0"><input type="checkbox" id="teDeleteOrphans" checked style="width:auto;margin-right:6px">同步删除孤儿文件</label>
+    <label style="margin:0"><input type="checkbox" id="teKeepRoot" checked style="width:auto;margin-right:6px">保留选定目录这一层</label>
+  </div>
+  <label>套壳目录名（留空则用云盘目录名）</label>
+  <input id="teRootName" placeholder="例如：我的电影">
+  <div class="hint">勾选了「保留选定目录这一层」时生效：给本任务输出套一个目录名（如 /strm/我的电影/…），不同任务用不同名字即可互不干扰。</div>
+  <div style="margin-top:12px">
+    <button class="ok" onclick="saveTask()">保存任务</button>
+    <button class="sec" onclick="saveTaskAndRun()">保存并运行</button>
+    <button onclick="cancelTaskEdit()">取消</button>
+  </div>
+  <div id="taskEditMsg" class="msg"></div>
 </div>
 
 <!-- CAS -->
@@ -193,6 +244,10 @@ pre.log{background:#1e2229;color:#d6d6d6;padding:12px;border-radius:8px;font-siz
   <input id="schFolder" value="/">
   <div class="hint">定时任务无网页请求上下文，必须先在「连接移动云盘」里填好「访问地址(base_url)」，否则会跳过本次运行。</div>
 
+  <label>套壳目录名（可选；定时生成时给"选定目录"加一层壳，留空则不套壳）</label>
+  <input id="schRootName" value="" placeholder="例如：我的影视库">
+  <div class="hint">勾选了「保留选定目录这一层」时生效：给这次定时生成的文件套一个目录名。因为定时没有界面，无法自动识别目录名，需你手动填（如填「我的影视库」则输出 /strm/我的影视库/…）。</div>
+
   <label>同步模式</label>
   <select id="schSyncMode">
     <option value="incremental">增量（跳过已生成）</option>
@@ -209,7 +264,7 @@ pre.log{background:#1e2229;color:#d6d6d6;padding:12px;border-radius:8px;font-siz
 
 <!-- 浏览器 -->
 <div class="card" id="browserCard" style="display:none">
-  <h2>4. 选择要生成的目录 <span class="badge">点击文件夹进入，选好后点「用这个目录」</span></h2>
+  <h2>选择要生成的目录 <span class="badge">点击文件夹进入，选好后点「用这个目录」</span></h2>
   <div id="crumb" class="hint"></div>
   <div id="fileList"></div>
   <button class="ok" onclick="useFolder()">用这个目录</button>
@@ -219,9 +274,9 @@ pre.log{background:#1e2229;color:#d6d6d6;padding:12px;border-radius:8px;font-siz
   <h2>使用说明</h2>
   <ol style="margin-left:20px;font-size:13.5px;line-height:1.9">
     <li>填入 Authorization 并测试连接</li>
-    <li>设置输出目录（需与 Emby 挂载同一个目录）</li>
-    <li>生成 STRM，等待任务完成</li>
-    <li>Emby 添加媒体库，扫描该目录即可入库</li>
+    <li>在「任务管理」点「新建任务」，浏览并选定一个云盘目录，保存</li>
+    <li>可建多个任务，每个对应一个目录；点「运行全部已启用」一次跑完</li>
+    <li>Emby 添加媒体库，扫描输出目录即可入库</li>
     <li>播放时 Emby 请求本项目 /d/ 地址，服务端 302 跳到移动云盘直链，<b>视频流不经过本机</b></li>
   </ol>
 </div>
@@ -231,6 +286,8 @@ pre.log{background:#1e2229;color:#d6d6d6;padding:12px;border-radius:8px;font-siz
 <script>
 let currentFolder = "/";
 let stack = [{id:"/", name:"根目录"}];
+let browserTarget = "adhoc";   // "adhoc" 或 "task"
+let editingTaskId = null;       // 编辑中的任务 id；新建时为 null
 
 function show(id, text, cls){
   const el = document.getElementById(id);
@@ -255,8 +312,10 @@ async function load(){
   document.getElementById("casEnabled").checked = r.cas_enabled !== false;
   document.getElementById("casTtl").value = r.cas_temp_ttl || 300;
   document.getElementById("casAllExt").checked = !!r.cas_allow_all_ext;
+  document.getElementById("keepRoot").checked = r.keep_root !== false;
   loadCasStatus();
   loadSchedule();
+  loadTasks();
 }
 
 async function loadCasStatus(){
@@ -301,6 +360,7 @@ async function save(){
     cloud_id: document.getElementById("cloudId").value,
     mail_cookies: document.getElementById("cookies").value,
     cas_enabled: document.getElementById("casEnabled").checked,
+    keep_root: document.getElementById("keepRoot").checked,
   };
   const auth = document.getElementById("auth").value.trim();
   if(auth) body.authorization = auth;
@@ -322,7 +382,9 @@ async function testConn(){
   }
 }
 
-async function pickFolder(){
+// ---- 浏览 ----
+async function pickFolder(target){
+  browserTarget = target || "adhoc";
   document.getElementById("browserCard").style.display = "block";
   document.getElementById("browserCard").scrollIntoView({behavior:"smooth"});
   browse("/");
@@ -348,9 +410,179 @@ async function browse(folder, push){
 }
 
 function useFolder(){
-  show("genMsg", "已选择目录：" + stack.map(s=>s.name).join(" / ") + "（点击「开始生成」）", "ok");
+  const path = stack.map(s=>s.name).join(" / ");
+  if(browserTarget === "task"){
+    openTaskEdit(path);
+  } else {
+    show("genMsg", "已选择目录：" + path + "（点击「开始生成」）", "ok");
+  }
 }
 
+// ---- 任务管理 ----
+async function loadTasks(){
+  try{
+    const r = await fetch("/api/tasks").then(x=>x.json());
+    if(!r.ok) return;
+    renderTasks(r.tasks || []);
+  }catch(e){}
+}
+
+function renderTasks(tasks){
+  const box = document.getElementById("taskList");
+  document.getElementById("taskCount").textContent = tasks.length ? (tasks.length + " 个") : "";
+  if(!tasks.length){
+    box.innerHTML = `<div class="hint" style="margin-top:8px">还没有任务。点上方「+ 新建任务」开始。</div>`;
+    return;
+  }
+  let html = `<table><tr><th>名称</th><th>目录</th><th>模式</th><th>启用</th><th>操作</th></tr>`;
+  tasks.forEach(t=>{
+    const mode = t.sync_mode === "force" ? "强同步" : "增量";
+    html += `<tr>
+      <td><b>${esc(t.name)}</b></td>
+      <td class="mono">${esc(t.folder_name || t.folder)}</td>
+      <td>${mode}</td>
+      <td>${t.enabled ? "✅" : "⛔"}</td>
+      <td><div class="task-ops">
+        <button class="sm ok" onclick="runOneTask('${t.id}')">运行</button>
+        <button class="sm sec" onclick="editTask('${t.id}')">编辑</button>
+        <button class="sm danger" onclick="deleteTask('${t.id}')">删除</button>
+      </div></td>
+    </tr>`;
+  });
+  html += "</table>";
+  box.innerHTML = html;
+}
+
+function esc(s){ return (s||"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function newTask(){
+  editingTaskId = null;
+  document.getElementById("taskEditTitle").textContent = "新建任务";
+  document.getElementById("teName").value = "";
+  document.getElementById("teFolderDisplay").value = "";
+  document.querySelector('input[name="teSyncMode"][value="incremental"]').checked = true;
+  document.getElementById("teRecursive").checked = true;
+  document.getElementById("teDeleteOrphans").checked = true;
+  document.getElementById("teKeepRoot").checked = true;
+  document.getElementById("teRootName").value = "";
+  hide("taskEditMsg");
+  document.getElementById("taskEditCard").style.display = "block";
+  document.getElementById("taskEditCard").scrollIntoView({behavior:"smooth"});
+  pickFolder("task");
+}
+
+async function editTask(id){
+  const r = await fetch("/api/tasks").then(x=>x.json());
+  const t = (r.tasks||[]).find(x=>x.id===id);
+  if(!t) return;
+  editingTaskId = id;
+  document.getElementById("taskEditTitle").textContent = "编辑任务：" + t.name;
+  document.getElementById("teName").value = t.name;
+  document.getElementById("teFolderDisplay").value = t.folder_name || t.folder;
+  document.querySelector(`input[name="teSyncMode"][value="${t.sync_mode||"incremental"}"]`).checked = true;
+  document.getElementById("teRecursive").checked = t.recursive !== false;
+  document.getElementById("teDeleteOrphans").checked = t.delete_orphans !== false;
+  document.getElementById("teKeepRoot").checked = t.keep_root !== false;
+  document.getElementById("teRootName").value = t.root_name || "";
+  hide("taskEditMsg");
+  document.getElementById("taskEditCard").style.display = "block";
+  document.getElementById("taskEditCard").scrollIntoView({behavior:"smooth"});
+}
+
+function openTaskEdit(path){
+  document.getElementById("browserCard").style.display = "none";
+  // 当前路径最后一级作为默认套壳名与任务名提示
+  const last = stack[stack.length-1];
+  const name = last && last.name !== "根目录" ? last.name : "";
+  if(editingTaskId === null){
+    document.getElementById("teName").value = name;
+    document.getElementById("teRootName").value = name;
+  }
+  document.getElementById("teFolderDisplay").value = path;
+  if(document.getElementById("taskEditCard").style.display !== "block"){
+    document.getElementById("taskEditCard").style.display = "block";
+    document.getElementById("taskEditCard").scrollIntoView({behavior:"smooth"});
+  }
+}
+
+function cancelTaskEdit(){
+  document.getElementById("taskEditCard").style.display = "none";
+  editingTaskId = null;
+}
+
+function collectTaskBody(){
+  return {
+    name: document.getElementById("teName").value.trim(),
+    folder: currentFolder,
+    folder_name: (stack[stack.length-1].name === "根目录" ? "" : stack[stack.length-1].name),
+    sync_mode: document.querySelector('input[name="teSyncMode"]:checked').value,
+    recursive: document.getElementById("teRecursive").checked,
+    delete_orphans: document.getElementById("teDeleteOrphans").checked,
+    keep_root: document.getElementById("teKeepRoot").checked,
+    root_name: document.getElementById("teRootName").value.trim(),
+  };
+}
+
+async function saveTask(){
+  const body = collectTaskBody();
+  if(!body.name){ show("taskEditMsg","任务名不能为空","err"); return; }
+  if(!body.folder){ show("taskEditMsg","未选择目录","err"); return; }
+  const url = editingTaskId ? ("/api/tasks/"+editingTaskId) : "/api/tasks";
+  const method = editingTaskId ? "PUT" : "POST";
+  const r = await fetch(url, {method, headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)}).then(x=>x.json());
+  if(!r.ok){ show("taskEditMsg", "保存失败："+(r.error||""), "err"); return; }
+  show("taskEditMsg", "任务已保存", "ok");
+  document.getElementById("taskEditCard").style.display = "none";
+  editingTaskId = null;
+  loadTasks();
+}
+
+async function saveTaskAndRun(){
+  const body = collectTaskBody();
+  if(!body.name){ show("taskEditMsg","任务名不能为空","err"); return; }
+  const url = editingTaskId ? ("/api/tasks/"+editingTaskId) : "/api/tasks";
+  const method = editingTaskId ? "PUT" : "POST";
+  const r = await fetch(url, {method, headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)}).then(x=>x.json());
+  if(!r.ok){ show("taskEditMsg", "保存失败："+(r.error||""), "err"); return; }
+  document.getElementById("taskEditCard").style.display = "none";
+  const id = r.task ? r.task.id : editingTaskId;
+  editingTaskId = null;
+  loadTasks();
+  if(id){ runOneTask(id); }
+}
+
+async function deleteTask(id){
+  if(!confirm("删除该任务？勾选下方选项可同时清理它生成的 strm 目录。")) return;
+  const clean = confirm("同时删除该任务生成的 strm 目录（只删它自己的那一层壳，不影响其他任务）？\n点「确定」清理，点「取消」只删任务保留文件。");
+  const r = await fetch("/api/tasks/"+id, {method:"DELETE", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({clean_output: clean})}).then(x=>x.json());
+  show("taskMsg", r.ok ? ("任务已删除" + (clean ? "（并已清理其输出目录）" : "")) : ("删除失败："+(r.error||"")), r.ok?"ok":"err");
+  loadTasks();
+}
+
+async function runOneTask(id){
+  const r = await fetch("/api/tasks/"+id+"/run",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(x=>x.json());
+  if(!r.ok){ show("taskMsg", r.error||"启动失败", "err"); return; }
+  show("taskMsg","任务已启动…","info");
+  poll();
+}
+
+async function runAllTasks(){
+  const r = await fetch("/api/tasks/run",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(x=>x.json());
+  if(!r.ok){ show("taskMsg", r.error||"启动失败", "err"); return; }
+  show("taskMsg","已启动全部任务…","info");
+  poll();
+}
+
+async function stopTasks(){
+  if(!confirm("确定强制终止当前运行中的任务吗？已生成的 strm 会保留，下次可继续。")) return;
+  const r = await fetch("/api/tasks/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(x=>x.json());
+  if(!r.ok){ show("taskMsg", r.error||"终止失败", "err"); return; }
+  show("taskMsg", r.stopped ? "已发送终止信号，正在停止当前任务…" : "当前没有运行中的任务", r.stopped ? "info" : "warn");
+  poll();
+}
+
+// ---- 一次性生成 ----
 async function generate(){
   const body = {
     folder: currentFolder,
@@ -362,6 +594,8 @@ async function generate(){
     recursive: document.getElementById("recursive").checked,
     sync_mode: document.querySelector('input[name="syncMode"]:checked').value,
     delete_orphans: document.getElementById("deleteOrphans").checked,
+    keep_root: document.getElementById("keepRoot").checked,
+    root_name: (stack.length > 1 ? stack[stack.length - 1].name : ""),
   };
   const r = await fetch("/api/strm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(x=>x.json());
   if(!r.ok){ show("genMsg", r.error, "err"); return; }
@@ -371,20 +605,35 @@ async function generate(){
 
 async function poll(){
   const r = await fetch("/api/strm/status").then(x=>x.json());
-  document.getElementById("taskPill").innerHTML =
-    r.running ? `<span class="pill p-run">${r.progress}</span>`
-              : (r.result?`<span class="pill p-ok">完成</span>`:"");
+  let pill = "";
+  if(r.running){
+    pill = `<span class="pill p-run">${r.progress||""}</span>`;
+    if(r.queue_total) pill += ` <span class="pill p-run">${r.queue_done||0}/${r.queue_total}</span>`;
+  } else if(r.results && r.results.length){
+    pill = `<span class="pill p-ok">完成</span>`;
+  }
+  document.getElementById("taskPill").innerHTML = pill;
+  document.getElementById("runAllPill").innerHTML = pill;
+  document.getElementById("stopBtn").style.display = r.running ? "inline-block" : "none";
   if(r.running){ setTimeout(poll, 1500); return; }
-  if(r.result){
-    const s = r.result;
-    show("genMsg", `完成：新建 ${s.created} 个、更新 ${s.updated||0} 个、跳过 ${s.skipped} 个、删除孤儿 ${s.deleted||0} 个、下载附属 ${s.copied} 个` +
-      (s.errors && s.errors.length ? `，${s.errors.length} 个错误` : ""), s.errors&&s.errors.length?"err":"ok");
+  if(r.results && r.results.length){
+    let msg = "完成：";
     let html = "<pre class='log'>";
-    (s.logs||[]).forEach(l=> html += l.replace(/</g,"&lt;") + "\n");
-    if(s.errors && s.errors.length){ html += "\n--- 错误 ---\n"; s.errors.forEach(e=> html += e + "\n"); }
+    r.results.forEach(res=>{
+      const s = res.summary || {};
+      const errs = (s.errors||[]).length;
+      msg += `「${res.name}」新建${s.created||0}/更新${s.updated||0}/跳过${s.skipped||0}/删孤儿${s.deleted||0}/下载${s.copied||0}` + (errs?`/错误${errs}`:"") + "；";
+      html += `【${res.name}】 新建 ${s.created||0} 更新 ${s.updated||0} 跳过 ${s.skipped||0} 删除孤儿 ${s.deleted||0} 下载附属 ${s.copied||0}\n`;
+      (s.logs||[]).forEach(l=> html += "  " + l + "\n");
+      if(errs){ html += "  --- 错误 ---\n"; (s.errors||[]).forEach(e=> html += "  " + e + "\n"); }
+    });
     html += "</pre>";
+    const ok = !r.results.some(x=>x.summary && x.summary.errors && x.summary.errors.length);
+    show("taskMsg", msg, ok?"ok":"err");
+    show("genMsg", msg, ok?"ok":"err");
     document.getElementById("logBox").innerHTML = html;
   }
+  loadTasks();
 }
 
 // ---- 定时同步 ----
@@ -398,6 +647,7 @@ async function loadSchedule(){
     document.getElementById("schInterval").value = (r.interval_hours ?? 6);
     document.getElementById("schFolder").value = r.folder || "/";
     document.getElementById("schSyncMode").value = r.sync_mode || "incremental";
+    document.getElementById("schRootName").value = r.schedule_root_name || "";
     renderSchStatus(r);
   }catch(e){}
 }
@@ -423,6 +673,7 @@ async function saveSchedule(){
     schedule_interval_hours: parseInt(document.getElementById("schInterval").value||6),
     schedule_folder: document.getElementById("schFolder").value || "/",
     schedule_sync_mode: document.getElementById("schSyncMode").value,
+    schedule_root_name: document.getElementById("schRootName").value || "",
   };
   const r = await fetch("/api/schedule",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(x=>x.json());
   show("schMsg", r.ok ? "定时设置已保存" : ("保存失败："+(r.error||"")), r.ok?"ok":"err");

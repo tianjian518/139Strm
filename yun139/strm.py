@@ -25,6 +25,11 @@ def sanitize_name(name: str) -> str:
     return re.sub(ILLEGAL_CHARS, "_", name).strip().rstrip(".")
 
 
+class CancelError(Exception):
+    """生成任务被手动终止时抛出，用于及时中断递归扫描。"""
+    pass
+
+
 class StrmGenerator:
     def __init__(self, client, base_url, output_dir,
                  media_ext=None, copy_ext=None, min_size_mb=0,
@@ -46,6 +51,8 @@ class StrmGenerator:
         # 删除孤儿：扫描结束后，删除本次同步范围内、源头已不存在的 .strm
         # （仅清理 .strm，绝不删字幕/图片等附属文件，避免误删用户手动放置的文件）
         self.delete_orphans = delete_orphans
+        # 终止标志：被 cancel() 置 True 后，下一个检查点抛出 CancelError
+        self.cancelled = False
 
         self.created = 0
         self.updated = 0
@@ -75,13 +82,24 @@ class StrmGenerator:
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         return ext in self.copy_ext
 
-    def generate(self, folder_id="/", relative_path="", force=None):
+    def cancel(self):
+        """请求终止当前生成。会在下一个检查点抛出 CancelError 中断递归。"""
+        self.cancelled = True
+
+    def generate(self, folder_id="/", relative_path="", force=None, root_name=None):
         """从指定目录开始递归生成。relative_path 为输出目录下的相对子目录。
 
         force 为 True 时覆盖已存在的 strm（强同步）；为 None 时沿用实例自身设置。
+        root_name 非空时，把"选定目录"的名称作为输出目录的第一层（建一层壳），
+        让目录结构更清晰（如选 /电影 → 输出 /strm/电影/...）。
         """
         if force is not None:
             self.force = force
+        if self.cancelled:
+            raise CancelError("生成已被手动终止")
+        # 仅顶层生效：把选定目录名套成输出第一层；递归调用时 relative_path 已非空、root_name 为 None
+        if root_name and relative_path == "":
+            relative_path = sanitize_name(root_name)
         try:
             items = self.client.list_files(folder_id)
         except Yun139Error as exc:
@@ -94,6 +112,8 @@ class StrmGenerator:
         self._touched_dirs.add(os.path.abspath(target_dir))
 
         for item in items:
+            if self.cancelled:
+                raise CancelError("生成已被手动终止")
             if item.is_folder:
                 if self.recursive:
                     sub = os.path.join(relative_path, sanitize_name(item.name)) if relative_path \
@@ -195,6 +215,7 @@ class StrmGenerator:
 
     def summary(self):
         return {
+            "cancelled": self.cancelled,
             "created": self.created,
             "updated": self.updated,
             "deleted": self.deleted,
