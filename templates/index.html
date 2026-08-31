@@ -2,698 +2,725 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-scale, initial-scale=1">
 <title>139Strm · 移动云盘 STRM 工具</title>
 <style>
-:root{--bg:#f5f6f8;--card:#fff;--ink:#1b1e23;--sub:#6b7280;--line:#e5e7eb;
---brand:#2563eb;--ok:#0f9d58;--bad:#dc2626;--warn:#e8912a;--soft:#eef4ff}
+:root{
+  --bg:#f3f4f6; --card:#fff; --ink:#1f2937; --sub:#6b7280; --line:#e5e7eb;
+  --brand:#2563eb; --brand-2:#1d4ed8; --soft:#eff6ff; --soft-line:#bfdbfe;
+  --ok:#16a34a; --warn:#d97706; --bad:#dc2626;
+  --run:#3b82f6; --edit:#1f2937; --log:#0ea5e9; --del:#ef4444;
+  --hover:#f9fafb;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;padding:18px 14px 50px}
-.wrap{max-width:900px;margin:0 auto}
-header{background:linear-gradient(135deg,#2563eb,#1e40af);color:#fff;border-radius:14px;padding:20px 22px;margin-bottom:16px}
-header h1{font-size:20px;font-weight:700}
-header p{opacity:.9;font-size:13.5px;margin-top:6px}
+html,body{height:100%}
+body{background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+a{color:var(--brand);text-decoration:none}
+button{font:inherit;cursor:pointer}
+
+/* 整体布局 */
+.layout{display:grid;grid-template-columns:220px 1fr;min-height:100vh}
+@media (max-width:720px){.layout{grid-template-columns:1fr}.sidebar{position:sticky;top:0;z-index:5}}
+
+/* 侧栏 */
+.sidebar{background:#fff;border-right:1px solid var(--line);padding:18px 0;display:flex;flex-direction:column}
+.brand{padding:4px 20px 18px;display:flex;align-items:center;gap:10px}
+.brand-logo{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#2563eb,#1e40af);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:15px}
+.brand-name{font-size:16px;font-weight:700;letter-spacing:.2px}
+.nav{padding:6px 10px;flex:1}
+.nav-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;color:#374151;cursor:pointer;font-size:14px;margin-bottom:2px}
+.nav-item:hover{background:var(--hover)}
+.nav-item.active{background:var(--soft);color:var(--brand-2);font-weight:600}
+.nav-item .icon{width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;color:#6b7280}
+.nav-item.active .icon{color:var(--brand-2)}
+.sidebar-foot{padding:14px 16px;border-top:1px solid var(--line);font-size:12px;color:var(--sub)}
+.exit-btn{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:10px;padding:9px 12px;width:calc(100% - 24px);margin-left:12px;margin-right:12px;border:1px solid var(--line);background:#fff;border-radius:8px;color:var(--bad);font-weight:600}
+.exit-btn:hover{background:#fef2f2}
+
+/* 主区 */
+.main{padding:22px 26px 60px;max-width:1100px;width:100%}
+.page{display:none}
+.page.active{display:block}
+.page-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.page-title{font-size:20px;font-weight:700}
+.page-sub{font-size:12.5px;color:var(--sub);margin-top:2px}
+
+/* 通用按钮 */
+.btn{display:inline-flex;align-items:center;gap:6px;background:var(--brand);color:#fff;border:0;border-radius:8px;padding:8px 14px;font-size:13.5px;font-weight:600}
+.btn:hover{background:var(--brand-2)}
+.btn:disabled{background:#9ca3af;cursor:not-allowed}
+.btn.sec{background:#fff;color:#374151;border:1px solid var(--line)}
+.btn.sec:hover{background:var(--hover)}
+.btn.ok{background:var(--ok)}.btn.ok:hover{filter:brightness(0.95)}
+.btn.warn{background:var(--warn)}
+.btn.danger{background:var(--bad)}
+.btn.run{background:var(--run)}
+.btn.icon{padding:6px 9px;font-size:13px;line-height:1}
+.btn.icon svg{width:14px;height:14px;display:block}
+
+/* 卡片 */
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:14px}
-h2{font-size:17px;font-weight:700;margin-bottom:12px;padding-left:10px;border-left:4px solid var(--brand)}
-label{display:block;font-size:13.5px;font-weight:600;margin:10px 0 4px;color:#374151}
-.hint{font-size:12.5px;color:var(--sub);margin-bottom:4px}
-input,select,textarea{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:14px;font-family:inherit}
-textarea{min-height:70px;resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
-button{background:var(--brand);color:#fff;border:0;border-radius:8px;padding:9px 18px;font-size:14px;font-weight:600;cursor:pointer;margin-top:12px}
-button:hover{filter:brightness(1.08)}
-button:disabled{background:#9ca3af;cursor:not-allowed}
-button.sec{background:#6b7280}
-button.ok{background:var(--ok)}
-button.danger{background:var(--bad)}
-button.sm{margin-top:0;padding:5px 12px;font-size:13px}
-.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-.msg{margin-top:12px;padding:10px 14px;border-radius:8px;font-size:13.5px;display:none}
+.card-title{font-size:15px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.card-title .badge{font-size:12px;background:var(--soft);color:var(--brand-2);padding:2px 8px;border-radius:20px;font-weight:600}
+.card-title .sub{font-size:12.5px;color:var(--sub);font-weight:400;margin-left:auto}
+
+/* 表单 */
+label{display:block;font-size:13px;font-weight:600;margin:10px 0 4px;color:#374151}
+.hint{font-size:12.5px;color:var(--sub);margin-bottom:4px;line-height:1.5}
+input[type=text],input[type=number],input[type=password],select,textarea{
+  width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:14px;font-family:inherit;background:#fff
+}
+input:focus,select:focus,textarea:focus{outline:0;border-color:var(--brand);box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+textarea{min-height:90px;resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.55}
+.row{display:flex;gap:12px;flex-wrap:wrap}
+.row > *{flex:1;min-width:160px}
+.checkbox{display:flex;align-items:center;gap:8px;margin:8px 0;font-size:13.5px;color:#374151;cursor:pointer}
+.checkbox input{width:auto}
+
+/* 任务表 */
+.tbl{width:100%;border-collapse:collapse;font-size:13.5px;margin-top:6px}
+.tbl th,.tbl td{border-bottom:1px solid var(--line);padding:11px 10px;text-align:left;vertical-align:middle}
+.tbl th{background:#f8fafc;font-weight:600;color:#475569;font-size:12.5px;letter-spacing:.2px}
+.tbl tr:hover td{background:var(--hover)}
+.tbl .ops{display:flex;gap:6px;justify-content:flex-end}
+.tbl .ops .btn.icon{background:#fff;color:#374151;border:1px solid var(--line)}
+.tbl .ops .btn.icon:hover{background:var(--soft);color:var(--brand-2);border-color:var(--soft-line)}
+.tbl .ops .btn.icon.del{color:var(--bad)}
+.tbl .ops .btn.icon.del:hover{background:#fef2f2;border-color:#fecaca}
+.tbl .empty{padding:46px 20px;text-align:center;color:var(--sub);font-size:13.5px}
+
+.pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:12px;font-weight:600;line-height:1.5}
+.p-ok{background:#dcfce7;color:#166534}
+.p-off{background:#f3f4f6;color:#6b7280}
+.p-run{background:#dbeafe;color:#1d4ed8}
+.p-bad{background:#fee2e2;color:#991b1b}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#475569}
+.cr{font-family:ui-monospace,Menlo,Consolas,monospace;background:#f3f4f6;padding:1px 6px;border-radius:5px;font-size:12px;color:#1f2937}
+
+/* 模态 */
+.modal-bg{position:fixed;inset:0;background:rgba(15,23,42,.45);display:none;align-items:center;justify-content:center;z-index:50}
+.modal-bg.show{display:flex}
+.modal{background:#fff;border-radius:14px;width:560px;max-width:92vw;max-height:88vh;overflow:auto;padding:22px 24px 20px;box-shadow:0 20px 60px rgba(0,0,0,.18)}
+.modal h3{font-size:16px;margin-bottom:14px}
+.modal .foot{display:flex;justify-content:flex-end;gap:8px;margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+
+/* 提示 */
+.msg{margin-top:10px;padding:8px 12px;border-radius:8px;font-size:13px;display:none}
 .msg.show{display:block}
-.msg.ok{background:#e6f6ee;color:#0b7a45;border:1px solid #b7e4cd}
-.msg.err{background:#fdecec;color:#b91c1c;border:1px solid #f5c2c2}
-.msg.info{background:var(--soft);color:#1a45b8;border:1px solid #cfe0ff}
-table{width:100%;border-collapse:collapse;font-size:13.5px;margin-top:10px}
-th,td{border:1px solid var(--line);padding:7px 9px;text-align:left}
-th{background:#f3f5f9}
-.dir{color:var(--brand);cursor:pointer;font-weight:600}
-.dir:hover{text-decoration:underline}
-.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
-.pill{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;font-weight:600}
-.p-ok{background:#e3f6ec;color:#0b7a45}
-.p-run{background:#fff0dd;color:#a36208}
-.badge{float:right;font-size:12px;color:var(--sub);font-weight:400}
-pre.log{background:#1e2229;color:#d6d6d6;padding:12px;border-radius:8px;font-size:12px;max-height:260px;overflow:auto;margin-top:10px}
-.task-ops{display:flex;gap:6px;flex-wrap:wrap}
+.msg.ok{background:#dcfce7;color:#166534;border:1px solid #bbf7d0}
+.msg.err{background:#fee2e2;color:#991b1b;border:1px solid #fecaca}
+.msg.info{background:var(--soft);color:var(--brand-2);border:1px solid var(--soft-line)}
+
+/* 日志 */
+pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;font-size:12px;line-height:1.5;max-height:340px;overflow:auto;margin-top:10px;font-family:ui-monospace,Menlo,Consolas,monospace}
+
+/* 目录浏览 */
+.browse-path{display:flex;align-items:center;gap:6px;background:#f3f4f6;border-radius:8px;padding:8px 10px;margin-bottom:8px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+.browse-path .crumb{color:var(--brand);cursor:pointer}
+.browse-path .crumb:hover{text-decoration:underline}
+.browse-list{background:#fff;border:1px solid var(--line);border-radius:8px;max-height:380px;overflow:auto}
+.browse-row{display:flex;align-items:center;gap:10px;padding:9px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+.browse-row:last-child{border-bottom:0}
+.browse-row:hover{background:var(--soft)}
+.browse-row .ico{color:#94a3b8}
+.browse-row .name{flex:1;font-weight:500}
+.browse-row .meta{color:var(--sub);font-size:12px}
+
+/* 状态条 */
+.statusbar{position:fixed;left:220px;right:0;bottom:0;background:#fff;border-top:1px solid var(--line);padding:8px 22px;font-size:13px;display:flex;align-items:center;gap:12px;z-index:4}
+@media (max-width:720px){.statusbar{left:0}}
+.statusbar .sp{flex:1;color:var(--sub)}
+.statusbar .sp b{color:var(--ink)}
+.statusbar .btn.icon{background:#fff;color:#374151;border:1px solid var(--line)}
+.statusbar .btn.icon:hover{background:var(--hover)}
+
+/* 版本号 */
+.ver{padding:10px 20px 4px;font-size:11.5px;color:var(--sub);font-family:ui-monospace,Menlo,Consolas,monospace}
+
+/* 表单内部分组 */
+.group{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-top:8px;background:#fafbfc}
+.group .gt{font-size:12.5px;color:var(--sub);font-weight:600;margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px}
 </style>
 </head>
 <body>
-<div class="wrap">
 
-<header>
-  <h1>139Strm · 移动云盘 STRM 工具</h1>
-  <p>直连移动云盘，生成 .strm 供 Emby / Jellyfin 入库；播放走 302 直跳云盘，不占本机带宽</p>
-</header>
-
-<!-- 配置 -->
-<div class="card">
-  <h2>1. 连接移动云盘</h2>
-
-  <label>Authorization（从 yun.139.com 抓包获取）</label>
-  <div class="hint">登录网页版后 F12 → 网络 → 任意请求 → 请求头 Authorization，<b>去掉开头的 Basic 空格</b> 后粘贴</div>
-  <textarea id="auth" placeholder="cGM6MTM4... 只填 Basic 后面那串 Base64"></textarea>
-  <div id="authState" class="hint"></div>
-
-  <div class="row">
-    <div style="flex:1;min-width:150px">
-      <label>云类型</label>
-      <select id="cloudType">
-        <option value="personal_new">新版个人云（推荐）</option>
-        <option value="personal">旧版个人云</option>
-        <option value="family">家庭云</option>
-        <option value="group">群组云</option>
-      </select>
+<div class="layout">
+  <!-- 侧栏 -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-logo">1</div>
+      <div class="brand-name">139Strm</div>
     </div>
-    <div style="flex:1;min-width:150px">
-      <label>最小文件大小(MB)</label>
-      <input id="minSize" type="number" value="0" min="0">
+    <nav class="nav" id="nav">
+      <div class="nav-item active" data-page="tasks">📋 任务管理</div>
+      <div class="nav-item" data-page="storage">💾 存储管理</div>
+      <div class="nav-item" data-page="browse">📂 存储浏览</div>
+      <div class="nav-item" data-page="plugins">🧩 插件管理</div>
+      <div class="nav-item" data-page="settings">⚙️ 系统设置</div>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="ver">v2.1 · 移动云盘直连</div>
+      <div class="exit-btn" onclick="alert('退出现在没有特殊作用，关闭浏览器即可。')">↩ 退出</div>
     </div>
-  </div>
+  </aside>
 
-  <label>139 邮箱 Cookie（可选，免抓包登录用）</label>
-  <div class="hint">留空即可。若使用，需登录 mail.10086.cn 后复制完整 Cookie（含 Os_SSo_Sid 与 RMKEY）</div>
-  <textarea id="cookies" placeholder="可留空"></textarea>
-  <div class="row">
-    <div style="flex:1;min-width:140px">
-      <label>手机号（配合 Cookie 登录）</label>
-      <input id="username" placeholder="可留空">
-    </div>
-    <div style="flex:1;min-width:140px">
-      <label>群组 ID（仅群组云需要）</label>
-      <input id="cloudId" placeholder="可留空">
-    </div>
-  </div>
+  <!-- 主区 -->
+  <main class="main">
 
-  <button onclick="save()">保存配置</button>
-  <button class="ok" onclick="testConn()">测试连接</button>
-  <div id="cfgMsg" class="msg"></div>
+    <!-- 任务管理 -->
+    <section class="page active" id="page-tasks">
+      <div class="page-head">
+        <div>
+          <div class="page-title">任务管理</div>
+          <div class="page-sub">一个云盘目录 = 一个任务，每任务独立定时与同步模式</div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn run" id="btnRunAll" onclick="runAll()">▶ 运行所有</button>
+          <button class="btn" onclick="openTaskModal()">+ 添加任务</button>
+        </div>
+      </div>
+      <div class="card" style="padding:0">
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th style="width:18%">任务名</th>
+              <th style="width:10%">存储</th>
+              <th style="width:26%">路径</th>
+              <th style="width:18%">定时 (crontab)</th>
+              <th style="width:18%">下次运行</th>
+              <th style="width:10%;text-align:right">操作</th>
+            </tr>
+          </thead>
+          <tbody id="taskRows">
+            <tr><td colspan="6" class="empty">还没有任务，点右上「+ 添加任务」建一个</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 存储管理 -->
+    <section class="page" id="page-storage">
+      <div class="page-head">
+        <div>
+          <div class="page-title">存储管理</div>
+          <div class="page-sub">移动云盘（139 / 和彩云）唯一支持的存储</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">💾 移动云盘 <span class="sub" id="authState"></span></div>
+        <label>Authorization（从 yun.139.com 抓包获取）</label>
+        <div class="hint">登录网页版后 F12 → 网络 → 任意请求 → 请求头 Authorization，<b>去掉开头的 Basic 空格</b> 后粘贴</div>
+        <textarea id="auth" placeholder="cGM6MTM4... 只填 Basic 后面那串 Base64"></textarea>
+
+        <div class="row">
+          <div>
+            <label>云类型</label>
+            <select id="cloudType">
+              <option value="personal_new">新版个人云（推荐）</option>
+              <option value="personal">旧版个人云</option>
+              <option value="family">家庭云</option>
+              <option value="group">群组云</option>
+            </select>
+          </div>
+          <div>
+            <label>基础地址（写入 strm 的地址，飞牛推荐 http://127.0.0.1:8025）</label>
+            <input id="baseUrl" type="text" placeholder="http://127.0.0.1:8025">
+          </div>
+        </div>
+
+        <label>139 邮箱 Cookie（可选，免抓包登录用）</label>
+        <div class="hint">留空即可；若使用，需登录 mail.10086.cn 后复制完整 Cookie（含 Os_SSo_Sid 与 RMKEY）</div>
+        <textarea id="cookies" placeholder="可留空"></textarea>
+        <div class="row">
+          <div>
+            <label>手机号（配合 Cookie 登录）</label>
+            <input id="username" placeholder="可留空">
+          </div>
+          <div>
+            <label>群组 ID（仅群组云需要）</label>
+            <input id="cloudId" placeholder="可留空">
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:14px">
+          <button class="btn sec" onclick="loadConfig()">↻ 重新加载</button>
+          <button class="btn" onclick="saveConfig()">保存配置</button>
+          <button class="btn ok" onclick="testConn()">测试连接</button>
+        </div>
+        <div id="cfgMsg" class="msg"></div>
+      </div>
+    </section>
+
+    <!-- 存储浏览 -->
+    <section class="page" id="page-browse">
+      <div class="page-head">
+        <div>
+          <div class="page-title">存储浏览</div>
+          <div class="page-sub">浏览云盘目录，把常用的目录一键建成任务</div>
+        </div>
+        <button class="btn" id="btnNewTaskFromBrowse" style="display:none" onclick="newTaskFromBrowse()">+ 在此目录新建任务</button>
+      </div>
+      <div class="card">
+        <div class="browse-path" id="browsePath"></div>
+        <div class="browse-list" id="browseList">
+          <div class="empty" style="padding:24px">登录后点「↻ 进入根目录」开始浏览</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 插件管理（占位） -->
+    <section class="page" id="page-plugins">
+      <div class="page-head">
+        <div>
+          <div class="page-title">插件管理</div>
+          <div class="page-sub">v2.1 占位：暂未引入插件系统，后续版本开放</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="hint" style="padding:18px;text-align:center">
+          插件系统正在规划中。139Strm 暂时只做「移动云盘 → STRM」一件事，保持简单。
+        </div>
+      </div>
+    </section>
+
+    <!-- 系统设置 -->
+    <section class="page" id="page-settings">
+      <div class="page-head">
+        <div>
+          <div class="page-title">系统设置</div>
+          <div class="page-sub">STRM 默认参数：任务没填就使用这里的值</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">📁 STRM 默认设置</div>
+
+        <div class="row">
+          <div style="flex:2">
+            <label>媒体文件后缀（默认）</label>
+            <div class="hint">逗号分隔，例如 mp4,mkv,avi,ts</div>
+            <input id="optMediaExt" type="text">
+          </div>
+          <div>
+            <label>媒体文件大小阈值 (MB)</label>
+            <div class="hint">小于此值跳过</div>
+            <input id="optMinSize" type="number" min="0" value="0">
+          </div>
+        </div>
+
+        <label>复制到本地的文件后缀（默认）</label>
+        <div class="hint">直接下载到本地的文件，如 srt,ass,jpg,nfo</div>
+        <input id="optCopyExt" type="text">
+
+        <label class="checkbox" style="margin-top:14px">
+          <input id="optUrlEncode" type="checkbox" checked>
+          URL 编码（对 strm 内的 URL 进行编码，兼容中文路径）
+        </label>
+
+        <div style="display:flex;gap:8px;margin-top:14px">
+          <button class="btn" onclick="saveConfig()">保存设置</button>
+        </div>
+        <div id="optMsg" class="msg"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">📺 CAS 秒传播放 <span class="sub" id="casPill"></span></div>
+        <div class="hint">.cas 是几百字节的特征码文件，靠秒传临时还原出真文件来播放。直链会缓存 2 小时。</div>
+        <div class="row">
+          <div>
+            <label class="checkbox"><input id="casEnabled" type="checkbox" checked> 启用 CAS 秒传播放</label>
+          </div>
+          <div>
+            <label>临时文件保留秒数</label>
+            <input id="casTtl" type="number" min="30" value="300">
+          </div>
+          <div>
+            <label class="checkbox"><input id="casAllowAll" type="checkbox"> 任何后缀都还原（默认只还原视频）</label>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button class="btn sec" onclick="casPurge()">立即清空残留临时文件</button>
+        </div>
+      </div>
+    </section>
+
+  </main>
 </div>
 
-<!-- 任务管理 -->
-<div class="card">
-  <h2>2. 任务管理 <span class="badge" id="taskCount"></span></h2>
-  <div class="hint">每个任务绑定一个云盘目录。新建任务选新目录，各任务互不影响；不想要的任务可删除（可一并清理它生成的 strm 目录）。推荐用任务来组织不同目录。</div>
-  <div id="taskList"></div>
-  <div style="margin-top:12px">
-    <button class="ok" onclick="newTask()">+ 新建任务</button>
-    <button class="sec" onclick="runAllTasks()">运行全部已启用</button>
-    <span id="runAllPill"></span>
-    <button id="stopBtn" style="display:none;background:#c0392b;color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;margin-left:8px" onclick="stopTasks()">⛔ 强制终止</button>
-  </div>
-  <div id="taskMsg" class="msg"></div>
+<!-- 状态条 -->
+<div class="statusbar">
+  <span id="stPill" class="pill p-off">空闲</span>
+  <span class="sp" id="stText">就绪</span>
+  <button class="btn icon" id="btnStop" style="display:none" onclick="stopTasks()">⛔ 强制终止</button>
 </div>
 
-<!-- 生成（一次性，不保存为任务） -->
-<div class="card">
-  <h2>3. 临时生成 <span class="badge">不保存，用完即弃</span></h2>
-  <div class="hint">适合临时生成一次、不想建任务的场景。浏览选目录后直接生成，行为与任务一致，但不会出现在任务列表里。</div>
-  <label>STRM 输出目录（容器内路径）</label>
-  <input id="outputDir" value="/strm">
-  <div class="hint">该目录需要同时挂载给 Emby / Jellyfin，两边路径保持一致</div>
+<!-- 任务编辑模态 -->
+<div class="modal-bg" id="taskModal">
+  <div class="modal">
+    <h3 id="taskModalTitle">添加任务</h3>
 
-  <label>访问地址（写入 strm 里的地址）</label>
-  <input id="baseUrl" placeholder="留空自动使用当前访问地址，如 http://192.168.1.10:8025">
-  <div class="hint">Emby 将通过此地址访问本项目，必须是播放器能连通的地址</div>
+    <label>任务名称 <span class="hint" style="display:inline;font-weight:400">（输出到 <span class="cr">/strm/&lt;任务名&gt;</span>，仅做展示用）</span></label>
+    <input id="f_name" type="text" placeholder="例：movie">
 
-  <label>媒体后缀（逗号分隔）</label>
-  <input id="mediaExt" value="mp4,mkv,avi,mov,wmv,flv,webm,m4v,ts,rmvb,iso">
-
-  <label>附带下载的后缀（字幕等，逗号分隔）</label>
-  <input id="copyExt" value="srt,ass,ssa,sub,vtt,nfo">
-
-  <div class="row" style="margin-top:10px">
-    <label style="margin:0"><input type="checkbox" id="recursive" checked style="width:auto;margin-right:6px">递归子目录</label>
-    <label style="margin:0"><input type="checkbox" id="casEnabled" checked style="width:auto;margin-right:6px">生成 .cas 秒传文件的 STRM</label>
-  </div>
-  <div class="hint">.cas 只有几百字节，是真实文件的"特征码"。勾选后照常生成 strm，播放时服务端会临时秒传还原出真文件再跳转，播完自动删掉临时文件。</div>
-
-  <div class="row" style="margin-top:10px">
-    <label style="margin:0"><input type="radio" name="syncMode" value="incremental" checked style="width:auto;margin-right:6px">增量同步（跳过已生成的）</label>
-    <label style="margin:0"><input type="radio" name="syncMode" value="force" style="width:auto;margin-right:6px">强同步（覆盖重新生成）</label>
-  </div>
-  <div class="hint">增量：同名 strm 已存在就跳过，只补新的；强同步：全部重新生成（覆盖旧文件）。</div>
-
-  <div class="row" style="margin-top:8px">
-    <label style="margin:0"><input type="checkbox" id="deleteOrphans" checked style="width:auto;margin-right:6px">同步删除孤儿文件（源头删了，本地 strm 也跟着删）</label>
-  </div>
-  <div class="hint">仅清理本次同步范围内、源头已不存在的 <b>.strm</b>；绝不删字幕 / 图片等附属文件，也不会动其他来源的 strm。建议与「强同步」搭配使用。</div>
-
-  <div class="row" style="margin-top:8px">
-    <label style="margin:0"><input type="checkbox" id="keepRoot" checked style="width:auto;margin-right:6px">在输出目录保留"选定目录"这一层（推荐）</label>
-  </div>
-  <div class="hint">勾选后，选 <b>/电影</b> 会生成 <b>/strm/电影/…</b> 的清晰结构；不勾则文件直接散在输出根目录（选根目录时此选项无效，始终不套壳）。</div>
-
-  <div style="margin-top:14px">
-    <button class="sec" onclick="pickFolder('adhoc')">浏览云盘目录</button>
-    <button class="ok" onclick="generate()">开始生成</button>
-    <span id="taskPill"></span>
-  </div>
-  <div id="genMsg" class="msg"></div>
-  <div id="logBox"></div>
-</div>
-
-<!-- 任务编辑（隐藏） -->
-<div class="card" id="taskEditCard" style="display:none">
-  <h2 id="taskEditTitle">新建任务</h2>
-  <label>任务名称</label>
-  <input id="teName" placeholder="例如：我的电影">
-  <label>已选目录</label>
-  <input id="teFolderDisplay" readonly style="background:#f3f5f9">
-  <div class="row" style="margin-top:10px">
-    <label style="margin:0"><input type="radio" name="teSyncMode" value="incremental" checked style="width:auto;margin-right:6px">增量同步</label>
-    <label style="margin:0"><input type="radio" name="teSyncMode" value="force" style="width:auto;margin-right:6px">强同步</label>
-  </div>
-  <div class="hint">增量：只补新文件；强同步：覆盖重生成全部 strm。</div>
-  <div class="row" style="margin-top:8px">
-    <label style="margin:0"><input type="checkbox" id="teRecursive" checked style="width:auto;margin-right:6px">递归子目录</label>
-    <label style="margin:0"><input type="checkbox" id="teDeleteOrphans" checked style="width:auto;margin-right:6px">同步删除孤儿文件</label>
-    <label style="margin:0"><input type="checkbox" id="teKeepRoot" checked style="width:auto;margin-right:6px">保留选定目录这一层</label>
-  </div>
-  <label>套壳目录名（留空则用云盘目录名）</label>
-  <input id="teRootName" placeholder="例如：我的电影">
-  <div class="hint">勾选了「保留选定目录这一层」时生效：给本任务输出套一个目录名（如 /strm/我的电影/…），不同任务用不同名字即可互不干扰。</div>
-  <div style="margin-top:12px">
-    <button class="ok" onclick="saveTask()">保存任务</button>
-    <button class="sec" onclick="saveTaskAndRun()">保存并运行</button>
-    <button onclick="cancelTaskEdit()">取消</button>
-  </div>
-  <div id="taskEditMsg" class="msg"></div>
-</div>
-
-<!-- CAS -->
-<div class="card">
-  <h2>CAS 秒传播放 <span class="badge" id="casPill"></span></h2>
-  <div class="row">
-    <div style="flex:1">
-      <label>临时文件保留时长（秒）</label>
-      <input id="casTtl" type="number" value="300">
+    <label>扫描路径 <span class="hint" style="display:inline;font-weight:400">（云盘里的目录）</span></label>
+    <div style="display:flex;gap:8px">
+      <input id="f_folder" type="text" placeholder="/video/movie">
+      <button class="btn sec" onclick="openFolderPicker()">📂 浏览</button>
     </div>
-    <div style="flex:1">
-      <label style="margin:0"><input type="checkbox" id="casAllExt" style="width:auto;margin-right:6px">还原所有类型（不限视频）</label>
-    </div>
-  </div>
-  <div class="hint">播放器拿到 302 后才会真正开始拉流，所以要预留一点时间再删临时文件。拖动进度条不会重复还原（直链已缓存）。</div>
-  <div style="margin-top:10px">
-    <button class="sec" onclick="purgeCas()">立即清空残留临时文件</button>
-    <button onclick="saveCas()">保存 CAS 设置</button>
-  </div>
-  <div id="casMsg" class="msg"></div>
-</div>
 
-<!-- 定时同步 -->
-<div class="card">
-  <h2>定时同步 <span class="badge" id="schPill"></span></h2>
-  <div class="hint">开启后按设定周期自动扫描云盘目录、生成 / 更新 STRM，无需手动点。增量模式只补新文件，强同步模式覆盖重生成。</div>
-
-  <div class="row" style="margin-top:8px">
-    <label style="margin:0"><input type="checkbox" id="schEnabled" style="width:auto;margin-right:6px">启用定时同步</label>
-  </div>
-
-  <label>同步方式</label>
-  <select id="schKind">
-    <option value="off">关闭</option>
-    <option value="daily">每天固定时间</option>
-    <option value="interval">每隔 N 小时</option>
-  </select>
-
-  <div class="row">
-    <div style="flex:1;min-width:160px">
-      <label>每天时间（时 : 分）</label>
-      <div class="row">
-        <input id="schHour" type="number" value="3" min="0" max="23" style="width:70px">
-        <span style="padding:0 4px">:</span>
-        <input id="schMinute" type="number" value="0" min="0" max="59" style="width:70px">
+    <div class="row">
+      <div>
+        <label>存储</label>
+        <select id="f_storage" disabled>
+          <option value="139">移动云盘（139）</option>
+        </select>
+      </div>
+      <div>
+        <label>同步模式</label>
+        <select id="f_sync">
+          <option value="incremental">增量（已有跳过）</option>
+          <option value="force">强同步（覆盖重生成）</option>
+        </select>
       </div>
     </div>
-    <div style="flex:1;min-width:160px">
-      <label>每隔几小时</label>
-      <input id="schInterval" type="number" value="6" min="1">
+
+    <label class="checkbox">
+      <input id="f_delorph" type="checkbox" checked> 同步删除（云盘里删了的 strm，本地也跟着删；仅删 .strm，不动字幕/图片）
+    </label>
+
+    <div class="group">
+      <div class="gt">可选：覆盖默认参数</div>
+      <div class="row">
+        <div>
+          <label>媒体文件后缀</label>
+          <input id="f_mediaext" type="text" placeholder="留空用默认">
+        </div>
+        <div>
+          <label>复制到本地的后缀</label>
+          <input id="f_copyext" type="text" placeholder="留空用默认">
+        </div>
+        <div>
+          <label>大小阈值 (MB)</label>
+          <input id="f_minsize" type="number" min="0" placeholder="留空用默认">
+        </div>
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="gt">定时（crontab，5 字段：分 时 日 月 周）</div>
+      <label>crontab 表达式 <span class="hint" style="display:inline;font-weight:400">（留空 = 不自动跑，只能手动点运行）</span></label>
+      <input id="f_cron" type="text" placeholder="例：43 3 * * *（每天 3:43）· */30 * * * *（每 30 分钟）">
+      <div class="hint">常用：<span class="cr">0 3 * * *</span> 每天凌晨3点 · <span class="cr">*/30 * * * *</span> 每30分钟 · <span class="cr">0 */6 * * *</span> 每6小时整点</div>
+    </div>
+
+    <div class="msg" id="taskMsg"></div>
+
+    <div class="foot">
+      <button class="btn sec" onclick="closeTaskModal()">取消</button>
+      <button class="btn danger" id="btnDelete" style="display:none" onclick="deleteCurrentTask()">删除任务</button>
+      <button class="btn" onclick="saveTask()">保存</button>
     </div>
   </div>
+</div>
 
-  <label>同步目录（云盘内路径，默认根目录）</label>
-  <input id="schFolder" value="/">
-  <div class="hint">定时任务无网页请求上下文，必须先在「连接移动云盘」里填好「访问地址(base_url)」，否则会跳过本次运行。</div>
-
-  <label>套壳目录名（可选；定时生成时给"选定目录"加一层壳，留空则不套壳）</label>
-  <input id="schRootName" value="" placeholder="例如：我的影视库">
-  <div class="hint">勾选了「保留选定目录这一层」时生效：给这次定时生成的文件套一个目录名。因为定时没有界面，无法自动识别目录名，需你手动填（如填「我的影视库」则输出 /strm/我的影视库/…）。</div>
-
-  <label>同步模式</label>
-  <select id="schSyncMode">
-    <option value="incremental">增量（跳过已生成）</option>
-    <option value="force">强同步（覆盖重生成）</option>
-  </select>
-
-  <div style="margin-top:12px">
-    <button class="ok" onclick="saveSchedule()">保存定时设置</button>
-    <button class="sec" onclick="runScheduleNow()">立即运行一次</button>
+<!-- 日志模态 -->
+<div class="modal-bg" id="logModal">
+  <div class="modal" style="width:680px">
+    <h3>运行日志 <span class="hint" style="font-weight:400;font-size:13px" id="logTaskName"></span></h3>
+    <pre class="log" id="logContent">暂无</pre>
+    <div class="foot">
+      <button class="btn sec" onclick="closeLog()">关闭</button>
+    </div>
   </div>
-  <div id="schMsg" class="msg"></div>
-  <div id="schStatus" class="hint"></div>
-</div>
-
-<!-- 浏览器 -->
-<div class="card" id="browserCard" style="display:none">
-  <h2>选择要生成的目录 <span class="badge">点击文件夹进入，选好后点「用这个目录」</span></h2>
-  <div id="crumb" class="hint"></div>
-  <div id="fileList"></div>
-  <button class="ok" onclick="useFolder()">用这个目录</button>
-</div>
-
-<div class="card">
-  <h2>使用说明</h2>
-  <ol style="margin-left:20px;font-size:13.5px;line-height:1.9">
-    <li>填入 Authorization 并测试连接</li>
-    <li>在「任务管理」点「新建任务」，浏览并选定一个云盘目录，保存</li>
-    <li>可建多个任务，每个对应一个目录；点「运行全部已启用」一次跑完</li>
-    <li>Emby 添加媒体库，扫描输出目录即可入库</li>
-    <li>播放时 Emby 请求本项目 /d/ 地址，服务端 302 跳到移动云盘直链，<b>视频流不经过本机</b></li>
-  </ol>
-</div>
-
 </div>
 
 <script>
-let currentFolder = "/";
-let stack = [{id:"/", name:"根目录"}];
-let browserTarget = "adhoc";   // "adhoc" 或 "task"
-let editingTaskId = null;       // 编辑中的任务 id；新建时为 null
-
-function show(id, text, cls){
-  const el = document.getElementById(id);
-  el.textContent = text;
-  el.className = "msg show " + (cls||"info");
+// ============ 工具 ============
+function $(id){return document.getElementById(id)}
+function show(el, kind, msg){
+  const m = $(el); m.className='msg show '+(kind||'info'); m.textContent=msg
+  setTimeout(()=>{m.className='msg'}, 6000)
 }
-function hide(id){ document.getElementById(id).className = "msg"; }
+function fmtDate(s){ if(!s) return '—'; const d=new Date(s); return d.toLocaleString('zh-CN',{hour12:false}) }
+function esc(s){ return String(s||'').replace(/[<>&"']/g, c=>({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'})[c]) }
 
-async function load(){
-  const r = await fetch("/api/config").then(x=>x.json());
-  if(r.cloud_type) document.getElementById("cloudType").value = r.cloud_type;
-  if(r.output_dir) document.getElementById("outputDir").value = r.output_dir;
-  if(r.base_url) document.getElementById("baseUrl").value = r.base_url;
-  if(r.media_ext) document.getElementById("mediaExt").value = r.media_ext.join(",");
-  if(r.copy_ext) document.getElementById("copyExt").value = r.copy_ext.join(",");
-  document.getElementById("minSize").value = r.min_size_mb || 0;
-  document.getElementById("cloudId").value = r.cloud_id || "";
-  document.getElementById("username").value = r.username || "";
-  document.getElementById("authState").textContent =
-    r.configured ? ("已保存凭据：" + r.authorization_masked) : "尚未配置";
-  if(r.configured) document.getElementById("auth").placeholder = "已保存，留空则不修改";
-  document.getElementById("casEnabled").checked = r.cas_enabled !== false;
-  document.getElementById("casTtl").value = r.cas_temp_ttl || 300;
-  document.getElementById("casAllExt").checked = !!r.cas_allow_all_ext;
-  document.getElementById("keepRoot").checked = r.keep_root !== false;
-  loadCasStatus();
-  loadSchedule();
-  loadTasks();
-}
-
-async function loadCasStatus(){
-  try{
-    const r = await fetch("/api/cas/status").then(x=>x.json());
-    const pill = document.getElementById("casPill");
-    if(r.ok){
-      pill.textContent = r.enabled
-        ? ("已启用 · 待清理 " + r.pending_cleanup + " 个")
-        : "已关闭";
-    }
-  }catch(e){}
-}
-
-async function saveCas(){
-  const body = {
-    cas_enabled: document.getElementById("casEnabled").checked,
-    cas_temp_ttl: parseInt(document.getElementById("casTtl").value||300),
-    cas_allow_all_ext: document.getElementById("casAllExt").checked,
-  };
-  const r = await fetch("/api/config", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)}).then(x=>x.json());
-  show("casMsg", r.ok ? "CAS 设置已保存" : ("保存失败："+r.error), r.ok?"ok":"err");
-  if(r.ok) loadCasStatus();
-}
-
-async function purgeCas(){
-  show("casMsg","正在清空…","info");
-  const r = await fetch("/api/cas/purge", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"}).then(x=>x.json());
-  show("casMsg", r.ok ? ("已清理 "+r.deleted+" 个残留临时文件") : ("清理失败："+r.error), r.ok?"ok":"err");
-  if(r.ok) loadCasStatus();
-}
-
-async function save(){
-  const body = {
-    cloud_type: document.getElementById("cloudType").value,
-    output_dir: document.getElementById("outputDir").value,
-    base_url: document.getElementById("baseUrl").value,
-    media_ext: document.getElementById("mediaExt").value,
-    copy_ext: document.getElementById("copyExt").value,
-    min_size_mb: parseFloat(document.getElementById("minSize").value||0),
-    username: document.getElementById("username").value,
-    cloud_id: document.getElementById("cloudId").value,
-    mail_cookies: document.getElementById("cookies").value,
-    cas_enabled: document.getElementById("casEnabled").checked,
-    keep_root: document.getElementById("keepRoot").checked,
-  };
-  const auth = document.getElementById("auth").value.trim();
-  if(auth) body.authorization = auth;
-  const r = await fetch("/api/config", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)}).then(x=>x.json());
-  show("cfgMsg", r.ok ? "配置已保存" : ("保存失败："+r.error), r.ok?"ok":"err");
-  load();
-}
-
-async function testConn(){
-  show("cfgMsg","正在连接移动云盘…","info");
-  const body = {cloud_type: document.getElementById("cloudType").value};
-  const auth = document.getElementById("auth").value.trim();
-  if(auth) body.authorization = auth;
-  const r = await fetch("/api/test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(x=>x.json());
-  if(r.ok){
-    show("cfgMsg", `连接成功！账号 ${r.account}，根目录 ${r.root_items} 个条目，凭据有效期至 ${r.expire||"未知"}`, "ok");
-  } else {
-    show("cfgMsg", "连接失败：" + r.error, "err");
+// ============ 导航 ============
+document.querySelectorAll('#nav .nav-item').forEach(el=>{
+  el.onclick = ()=> {
+    document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'))
+    document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'))
+    el.classList.add('active')
+    $('page-'+el.dataset.page).classList.add('active')
+    if (el.dataset.page==='browse') openBrowse('/')
+    if (el.dataset.page==='storage') loadConfig()
+    if (el.dataset.page==='settings') { loadConfig(); loadCas() }
+    if (el.dataset.page==='tasks') loadTasks()
   }
-}
+})
 
-// ---- 浏览 ----
-async function pickFolder(target){
-  browserTarget = target || "adhoc";
-  document.getElementById("browserCard").style.display = "block";
-  document.getElementById("browserCard").scrollIntoView({behavior:"smooth"});
-  browse("/");
-}
+// ============ 任务 ============
+let editingId = null
+let currentFolder = '/'
 
-async function browse(folder, push){
-  const r = await fetch("/api/list?folder="+encodeURIComponent(folder)).then(x=>x.json());
-  if(!r.ok){ alert("列出失败："+r.error); return; }
-  if(push) stack.push({id:folder, name:push});
-  currentFolder = folder;
-  document.getElementById("crumb").textContent = "当前：" + stack.map(s=>s.name).join(" / ");
-  let html = `<table><tr><th>名称</th><th>类型</th><th>大小</th></tr>`;
-  r.items.forEach(it=>{
-    const size = it.is_folder ? "-" : (it.size/1048576).toFixed(1)+" MB";
-    if(it.is_folder){
-      html += `<tr><td class="dir" onclick="browse('${it.file_id}','${it.name.replace(/'/g,"")}')">📁 ${it.name}</td><td>目录</td><td>${size}</td></tr>`;
-    } else {
-      html += `<tr><td>${it.name}</td><td>文件</td><td>${size}</td></tr>`;
-    }
-  });
-  html += "</table>";
-  document.getElementById("fileList").innerHTML = html;
-}
-
-function useFolder(){
-  const path = stack.map(s=>s.name).join(" / ");
-  if(browserTarget === "task"){
-    openTaskEdit(path);
-  } else {
-    show("genMsg", "已选择目录：" + path + "（点击「开始生成」）", "ok");
-  }
-}
-
-// ---- 任务管理 ----
 async function loadTasks(){
-  try{
-    const r = await fetch("/api/tasks").then(x=>x.json());
-    if(!r.ok) return;
-    renderTasks(r.tasks || []);
-  }catch(e){}
-}
-
-function renderTasks(tasks){
-  const box = document.getElementById("taskList");
-  document.getElementById("taskCount").textContent = tasks.length ? (tasks.length + " 个") : "";
-  if(!tasks.length){
-    box.innerHTML = `<div class="hint" style="margin-top:8px">还没有任务。点上方「+ 新建任务」开始。</div>`;
-    return;
+  const r = await fetch('/api/tasks').then(r=>r.json())
+  const tb = $('taskRows')
+  if (!r.tasks || r.tasks.length === 0){
+    tb.innerHTML = '<tr><td colspan="6" class="empty">还没有任务，点右上「+ 添加任务」建一个</td></tr>'
+    return
   }
-  let html = `<table><tr><th>名称</th><th>目录</th><th>模式</th><th>启用</th><th>操作</th></tr>`;
-  tasks.forEach(t=>{
-    const mode = t.sync_mode === "force" ? "强同步" : "增量";
-    html += `<tr>
-      <td><b>${esc(t.name)}</b></td>
-      <td class="mono">${esc(t.folder_name || t.folder)}</td>
-      <td>${mode}</td>
-      <td>${t.enabled ? "✅" : "⛔"}</td>
-      <td><div class="task-ops">
-        <button class="sm ok" onclick="runOneTask('${t.id}')">运行</button>
-        <button class="sm sec" onclick="editTask('${t.id}')">编辑</button>
-        <button class="sm danger" onclick="deleteTask('${t.id}')">删除</button>
-      </div></td>
-    </tr>`;
-  });
-  html += "</table>";
-  box.innerHTML = html;
+  tb.innerHTML = r.tasks.map(t => `
+    <tr>
+      <td><b>${esc(t.name)}</b>${t.enabled===false?'':'<br><span class="pill p-ok" style="font-size:11px">启用</span>'}</td>
+      <td><span class="mono">移动云盘</span></td>
+      <td class="mono">${esc(t.folder)}</td>
+      <td>${t.cron ? `<span class="cr">${esc(t.cron)}</span>` : '<span class="pill p-off">未设置</span>'}</td>
+      <td class="mono">${t.cron ? fmtDate(t.next_run_at) : '—'}</td>
+      <td>
+        <div class="ops">
+          <button class="btn icon" title="运行" onclick="runOne('${t.id}')">▶</button>
+          <button class="btn icon" title="编辑" onclick="openTaskModal('${t.id}')">✎</button>
+          <button class="btn icon" title="日志" onclick="openLog('${t.id}','${esc(t.name)}')">📋</button>
+          <button class="btn icon del" title="删除" onclick="askDelete('${t.id}','${esc(t.name)}')">🗑</button>
+        </div>
+      </td>
+    </tr>
+  `).join('')
 }
 
-function esc(s){ return (s||"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
-
-function newTask(){
-  editingTaskId = null;
-  document.getElementById("taskEditTitle").textContent = "新建任务";
-  document.getElementById("teName").value = "";
-  document.getElementById("teFolderDisplay").value = "";
-  document.querySelector('input[name="teSyncMode"][value="incremental"]').checked = true;
-  document.getElementById("teRecursive").checked = true;
-  document.getElementById("teDeleteOrphans").checked = true;
-  document.getElementById("teKeepRoot").checked = true;
-  document.getElementById("teRootName").value = "";
-  hide("taskEditMsg");
-  document.getElementById("taskEditCard").style.display = "block";
-  document.getElementById("taskEditCard").scrollIntoView({behavior:"smooth"});
-  pickFolder("task");
-}
-
-async function editTask(id){
-  const r = await fetch("/api/tasks").then(x=>x.json());
-  const t = (r.tasks||[]).find(x=>x.id===id);
-  if(!t) return;
-  editingTaskId = id;
-  document.getElementById("taskEditTitle").textContent = "编辑任务：" + t.name;
-  document.getElementById("teName").value = t.name;
-  document.getElementById("teFolderDisplay").value = t.folder_name || t.folder;
-  document.querySelector(`input[name="teSyncMode"][value="${t.sync_mode||"incremental"}"]`).checked = true;
-  document.getElementById("teRecursive").checked = t.recursive !== false;
-  document.getElementById("teDeleteOrphans").checked = t.delete_orphans !== false;
-  document.getElementById("teKeepRoot").checked = t.keep_root !== false;
-  document.getElementById("teRootName").value = t.root_name || "";
-  hide("taskEditMsg");
-  document.getElementById("taskEditCard").style.display = "block";
-  document.getElementById("taskEditCard").scrollIntoView({behavior:"smooth"});
-}
-
-function openTaskEdit(path){
-  document.getElementById("browserCard").style.display = "none";
-  // 当前路径最后一级作为默认套壳名与任务名提示
-  const last = stack[stack.length-1];
-  const name = last && last.name !== "根目录" ? last.name : "";
-  if(editingTaskId === null){
-    document.getElementById("teName").value = name;
-    document.getElementById("teRootName").value = name;
+function openTaskModal(id){
+  editingId = id || null
+  $('taskModalTitle').textContent = id ? '编辑任务' : '添加任务'
+  $('btnDelete').style.display = id ? '' : 'none'
+  $('taskMsg').className = 'msg'
+  if (id){
+    fetch('/api/tasks').then(r=>r.json()).then(j=>{
+      const t = j.tasks.find(x=>x.id===id); if(!t) return
+      $('f_name').value = t.name
+      $('f_folder').value = t.folder
+      $('f_sync').value = t.sync_mode || 'incremental'
+      $('f_delorph').checked = !!t.delete_orphans
+      $('f_mediaext').value = (t.media_ext||[]).join(',')
+      $('f_copyext').value = (t.copy_ext||[]).join(',')
+      $('f_minsize').value = t.min_size_mb ?? ''
+      $('f_cron').value = t.cron || ''
+    })
+  } else {
+    ['f_name','f_folder','f_mediaext','f_copyext','f_cron'].forEach(k=>$(k).value='')
+    $('f_minsize').value = ''
+    $('f_sync').value = 'incremental'
+    $('f_delorph').checked = true
   }
-  document.getElementById("teFolderDisplay").value = path;
-  if(document.getElementById("taskEditCard").style.display !== "block"){
-    document.getElementById("taskEditCard").style.display = "block";
-    document.getElementById("taskEditCard").scrollIntoView({behavior:"smooth"});
-  }
+  $('taskModal').classList.add('show')
 }
-
-function cancelTaskEdit(){
-  document.getElementById("taskEditCard").style.display = "none";
-  editingTaskId = null;
-}
-
-function collectTaskBody(){
-  return {
-    name: document.getElementById("teName").value.trim(),
-    folder: currentFolder,
-    folder_name: (stack[stack.length-1].name === "根目录" ? "" : stack[stack.length-1].name),
-    sync_mode: document.querySelector('input[name="teSyncMode"]:checked').value,
-    recursive: document.getElementById("teRecursive").checked,
-    delete_orphans: document.getElementById("teDeleteOrphans").checked,
-    keep_root: document.getElementById("teKeepRoot").checked,
-    root_name: document.getElementById("teRootName").value.trim(),
-  };
-}
+function closeTaskModal(){ $('taskModal').classList.remove('show'); editingId=null }
 
 async function saveTask(){
-  const body = collectTaskBody();
-  if(!body.name){ show("taskEditMsg","任务名不能为空","err"); return; }
-  if(!body.folder){ show("taskEditMsg","未选择目录","err"); return; }
-  const url = editingTaskId ? ("/api/tasks/"+editingTaskId) : "/api/tasks";
-  const method = editingTaskId ? "PUT" : "POST";
-  const r = await fetch(url, {method, headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)}).then(x=>x.json());
-  if(!r.ok){ show("taskEditMsg", "保存失败："+(r.error||""), "err"); return; }
-  show("taskEditMsg", "任务已保存", "ok");
-  document.getElementById("taskEditCard").style.display = "none";
-  editingTaskId = null;
-  loadTasks();
+  const body = {
+    name: $('f_name').value.trim(),
+    folder: $('f_folder').value.trim() || '/',
+    sync_mode: $('f_sync').value,
+    delete_orphans: $('f_delorph').checked,
+    media_ext: $('f_mediaext').value.trim() || null,
+    copy_ext: $('f_copyext').value.trim() || null,
+    min_size_mb: $('f_minsize').value,
+    cron: $('f_cron').value.trim(),
+  }
+  if (!body.name){ show('taskMsg','err','任务名不能为空'); return }
+  if (!body.folder){ show('taskMsg','err','请选择扫描路径'); return }
+  const url = editingId ? `/api/tasks/${editingId}` : '/api/tasks'
+  const method = editingId ? 'PUT' : 'POST'
+  const r = await fetch(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json())
+  if (!r.ok){ show('taskMsg','err', r.error || '保存失败'); return }
+  closeTaskModal()
+  loadTasks()
 }
 
-async function saveTaskAndRun(){
-  const body = collectTaskBody();
-  if(!body.name){ show("taskEditMsg","任务名不能为空","err"); return; }
-  const url = editingTaskId ? ("/api/tasks/"+editingTaskId) : "/api/tasks";
-  const method = editingTaskId ? "PUT" : "POST";
-  const r = await fetch(url, {method, headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)}).then(x=>x.json());
-  if(!r.ok){ show("taskEditMsg", "保存失败："+(r.error||""), "err"); return; }
-  document.getElementById("taskEditCard").style.display = "none";
-  const id = r.task ? r.task.id : editingTaskId;
-  editingTaskId = null;
-  loadTasks();
-  if(id){ runOneTask(id); }
+async function askDelete(id, name){
+  if (!confirm(`删除任务「${name}」？\n\n（可勾选同时清理它生成的 strm 目录）`)) return
+  let clean = false
+  if (confirm(`要不要同时删除「${name}」生成的 strm 目录？\n（点确定=删；点取消=保留）`)) clean = true
+  const r = await fetch(`/api/tasks/${id}`,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({clean_output: clean})}).then(r=>r.json())
+  if (!r.ok){ alert('删除失败：'+(r.error||'')); return }
+  loadTasks()
+}
+async function deleteCurrentTask(){
+  if (!editingId) return
+  const name = $('f_name').value
+  if (!confirm(`确认删除任务「${name}」？`)) return
+  const r = await fetch(`/api/tasks/${editingId}`,{method:'DELETE'}).then(r=>r.json())
+  if (!r.ok){ alert('删除失败：'+(r.error||'')); return }
+  closeTaskModal(); loadTasks()
 }
 
-async function deleteTask(id){
-  if(!confirm("删除该任务？勾选下方选项可同时清理它生成的 strm 目录。")) return;
-  const clean = confirm("同时删除该任务生成的 strm 目录（只删它自己的那一层壳，不影响其他任务）？\n点「确定」清理，点「取消」只删任务保留文件。");
-  const r = await fetch("/api/tasks/"+id, {method:"DELETE", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({clean_output: clean})}).then(x=>x.json());
-  show("taskMsg", r.ok ? ("任务已删除" + (clean ? "（并已清理其输出目录）" : "")) : ("删除失败："+(r.error||"")), r.ok?"ok":"err");
-  loadTasks();
+async function runOne(id){
+  const r = await fetch(`/api/tasks/${id}/run`,{method:'POST'}).then(r=>r.json())
+  if (!r.ok) alert('启动失败：'+r.error)
+  pollStatus(true)
 }
-
-async function runOneTask(id){
-  const r = await fetch("/api/tasks/"+id+"/run",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(x=>x.json());
-  if(!r.ok){ show("taskMsg", r.error||"启动失败", "err"); return; }
-  show("taskMsg","任务已启动…","info");
-  poll();
+async function runAll(){
+  const r = await fetch('/api/tasks/run',{method:'POST'}).then(r=>r.json())
+  if (!r.ok) alert('启动失败：'+r.error)
+  pollStatus(true)
 }
-
-async function runAllTasks(){
-  const r = await fetch("/api/tasks/run",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(x=>x.json());
-  if(!r.ok){ show("taskMsg", r.error||"启动失败", "err"); return; }
-  show("taskMsg","已启动全部任务…","info");
-  poll();
-}
-
 async function stopTasks(){
-  if(!confirm("确定强制终止当前运行中的任务吗？已生成的 strm 会保留，下次可继续。")) return;
-  const r = await fetch("/api/tasks/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(x=>x.json());
-  if(!r.ok){ show("taskMsg", r.error||"终止失败", "err"); return; }
-  show("taskMsg", r.stopped ? "已发送终止信号，正在停止当前任务…" : "当前没有运行中的任务", r.stopped ? "info" : "warn");
-  poll();
+  const r = await fetch('/api/tasks/stop',{method:'POST'}).then(r=>r.json())
+  pollStatus(true)
 }
 
-// ---- 一次性生成 ----
-async function generate(){
-  const body = {
-    folder: currentFolder,
-    output_dir: document.getElementById("outputDir").value,
-    base_url: document.getElementById("baseUrl").value,
-    media_ext: document.getElementById("mediaExt").value.split(",").map(s=>s.trim()).filter(Boolean),
-    copy_ext: document.getElementById("copyExt").value.split(",").map(s=>s.trim()).filter(Boolean),
-    min_size_mb: parseFloat(document.getElementById("minSize").value||0),
-    recursive: document.getElementById("recursive").checked,
-    sync_mode: document.querySelector('input[name="syncMode"]:checked').value,
-    delete_orphans: document.getElementById("deleteOrphans").checked,
-    keep_root: document.getElementById("keepRoot").checked,
-    root_name: (stack.length > 1 ? stack[stack.length - 1].name : ""),
-  };
-  const r = await fetch("/api/strm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(x=>x.json());
-  if(!r.ok){ show("genMsg", r.error, "err"); return; }
-  show("genMsg","任务已启动，正在扫描…","info");
-  poll();
+async function openLog(id, name){
+  $('logTaskName').textContent = '· '+name
+  $('logContent').textContent = '加载中…'
+  $('logModal').classList.add('show')
+  const j = await fetch('/api/tasks').then(r=>r.json())
+  const t = j.tasks.find(x=>x.id===id)
+  const s = t && t.last_summary
+  if (!s){ $('logContent').textContent='该任务还没运行过' ; return }
+  const lines = []
+  lines.push(`最近一次运行：${fmtDate(t.last_run_at)}`)
+  lines.push(`生成：${s.created||0}  更新：${s.updated||0}  跳过：${s.skipped||0}  复制：${s.copied||0}  删除：${s.deleted||0}  CAS：${s.cas||0}`)
+  if (s.cancelled) lines.push('⚠ 已手动终止')
+  if (s.errors && s.errors.length) lines.push('错误：\n' + s.errors.join('\n'))
+  if (s.logs && s.logs.length) lines.push('\n日志：\n' + s.logs.join('\n'))
+  $('logContent').textContent = lines.join('\n')
 }
+function closeLog(){ $('logModal').classList.remove('show') }
 
-async function poll(){
-  const r = await fetch("/api/strm/status").then(x=>x.json());
-  let pill = "";
-  if(r.running){
-    pill = `<span class="pill p-run">${r.progress||""}</span>`;
-    if(r.queue_total) pill += ` <span class="pill p-run">${r.queue_done||0}/${r.queue_total}</span>`;
-  } else if(r.results && r.results.length){
-    pill = `<span class="pill p-ok">完成</span>`;
-  }
-  document.getElementById("taskPill").innerHTML = pill;
-  document.getElementById("runAllPill").innerHTML = pill;
-  document.getElementById("stopBtn").style.display = r.running ? "inline-block" : "none";
-  if(r.running){ setTimeout(poll, 1500); return; }
-  if(r.results && r.results.length){
-    let msg = "完成：";
-    let html = "<pre class='log'>";
-    r.results.forEach(res=>{
-      const s = res.summary || {};
-      const errs = (s.errors||[]).length;
-      msg += `「${res.name}」新建${s.created||0}/更新${s.updated||0}/跳过${s.skipped||0}/删孤儿${s.deleted||0}/下载${s.copied||0}` + (errs?`/错误${errs}`:"") + "；";
-      html += `【${res.name}】 新建 ${s.created||0} 更新 ${s.updated||0} 跳过 ${s.skipped||0} 删除孤儿 ${s.deleted||0} 下载附属 ${s.copied||0}\n`;
-      (s.logs||[]).forEach(l=> html += "  " + l + "\n");
-      if(errs){ html += "  --- 错误 ---\n"; (s.errors||[]).forEach(e=> html += "  " + e + "\n"); }
-    });
-    html += "</pre>";
-    const ok = !r.results.some(x=>x.summary && x.summary.errors && x.summary.errors.length);
-    show("taskMsg", msg, ok?"ok":"err");
-    show("genMsg", msg, ok?"ok":"err");
-    document.getElementById("logBox").innerHTML = html;
-  }
-  loadTasks();
-}
-
-// ---- 定时同步 ----
-async function loadSchedule(){
-  try{
-    const r = await fetch("/api/schedule").then(x=>x.json());
-    document.getElementById("schEnabled").checked = !!r.enabled;
-    document.getElementById("schKind").value = r.kind || "off";
-    document.getElementById("schHour").value = (r.hour ?? 3);
-    document.getElementById("schMinute").value = (r.minute ?? 0);
-    document.getElementById("schInterval").value = (r.interval_hours ?? 6);
-    document.getElementById("schFolder").value = r.folder || "/";
-    document.getElementById("schSyncMode").value = r.sync_mode || "incremental";
-    document.getElementById("schRootName").value = r.schedule_root_name || "";
-    renderSchStatus(r);
-  }catch(e){}
-}
-
-function renderSchStatus(r){
-  if(r.enabled && r.kind && r.kind!=="off"){
-    document.getElementById("schPill").textContent = r.running ? "运行中" : "已启用";
-    let s = "上次运行：" + (r.last_run_at ? r.last_run_at : "暂无");
-    if(r.next_run_at) s += " ｜ 下次运行：" + r.next_run_at;
-    document.getElementById("schStatus").textContent = s;
+// ============ 状态轮询 ============
+let pollTimer = null
+async function pollStatus(immediate){
+  const j = await fetch('/api/strm/status').then(r=>r.json())
+  const pill = $('stPill'); const txt = $('stText'); const stop = $('btnStop')
+  if (j.running){
+    pill.className = 'pill p-run'
+    pill.textContent = '运行中'
+    const cur = j.current ? `· ${j.current}` : ''
+    txt.innerHTML = `<b>${esc(j.progress||'')}</b> ${esc(cur)} （${j.queue_done||0}/${j.queue_total||0}）`
+    stop.style.display = ''
   } else {
-    document.getElementById("schPill").textContent = "未启用";
-    document.getElementById("schStatus").textContent = "";
+    pill.className = 'pill ' + ((j.queue_total>0 && j.queue_done>=j.queue_total) ? 'p-ok' : 'p-off')
+    pill.textContent = '空闲'
+    txt.textContent = j.progress || '就绪'
+    stop.style.display = 'none'
+    if (immediate && j.results && j.results.length) {
+      const last = j.results[j.results.length-1]
+      if (last && last.summary){
+        const s = last.summary
+        const tail = ` · 末次：${esc(last.name)} 新${s.created||0}/更${s.updated||0}/跳${s.skipped||0}/删${s.deleted||0}${s.cas?`/CAS${s.cas}`:''}${s.cancelled?'/已终止':''}${s.errors&&s.errors.length?'/有错误':''}`
+        txt.textContent += tail
+      }
+    }
+  }
+  if (!pollTimer) pollTimer = setInterval(()=>pollStatus(false), 2000)
+}
+
+// ============ 存储配置 ============
+async function loadConfig(){
+  const j = await fetch('/api/config').then(r=>r.json())
+  $('auth').value = ''
+  $('authState').textContent = j.configured ? `· 当前已配置凭据（${j.authorization_masked}）` : '· 尚未配置'
+  $('cloudType').value = j.cloud_type || 'personal_new'
+  $('baseUrl').value = j.base_url || ''
+  $('cookies').value = j.mail_cookies || ''
+  $('username').value = j.username || ''
+  $('cloudId').value = j.cloud_id || ''
+  $('optMediaExt').value = (j.media_ext||[]).join(',')
+  $('optCopyExt').value = (j.copy_ext||[]).join(',')
+  $('optMinSize').value = j.min_size_mb || 0
+  $('optUrlEncode').checked = !!j.url_encode
+  $('casEnabled').checked = !!j.cas_enabled
+  $('casTtl').value = j.cas_temp_ttl || 300
+  $('casAllowAll').checked = !!j.cas_allow_all_ext
+}
+async function saveConfig(){
+  const body = {
+    authorization: $('auth').value.trim(),
+    cloud_type: $('cloudType').value,
+    base_url: $('baseUrl').value.trim(),
+    mail_cookies: $('cookies').value,
+    username: $('username').value,
+    cloud_id: $('cloudId').value,
+    media_ext: $('optMediaExt').value,
+    copy_ext: $('optCopyExt').value,
+    min_size_mb: parseFloat($('optMinSize').value||0),
+    url_encode: $('optUrlEncode').checked,
+    cas_enabled: $('casEnabled').checked,
+    cas_temp_ttl: parseInt($('casTtl').value||300),
+    cas_allow_all_ext: $('casAllowAll').checked,
+  }
+  const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json())
+  show('cfgMsg', r.ok?'ok':'err', r.ok?'已保存':(r.error||'保存失败'))
+  if (r.ok) loadConfig()
+}
+async function testConn(){
+  const body = {
+    authorization: $('auth').value.trim() || undefined,
+    cloud_type: $('cloudType').value,
+  }
+  const r = await fetch('/api/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json())
+  if (r.ok){
+    show('cfgMsg','ok', `✓ 连接成功！账号 ${r.account||'(未识别)'}，根目录 ${r.root_items} 项，CDN ${r.host||''}${r.expire?'，凭据 '+fmtDate(r.expire)+' 到期':''}`)
+  } else {
+    show('cfgMsg','err', '连接失败：'+(r.error||''))
   }
 }
 
-async function saveSchedule(){
-  const body = {
-    schedule_enabled: document.getElementById("schEnabled").checked,
-    schedule_kind: document.getElementById("schKind").value,
-    schedule_hour: parseInt(document.getElementById("schHour").value||3),
-    schedule_minute: parseInt(document.getElementById("schMinute").value||0),
-    schedule_interval_hours: parseInt(document.getElementById("schInterval").value||6),
-    schedule_folder: document.getElementById("schFolder").value || "/",
-    schedule_sync_mode: document.getElementById("schSyncMode").value,
-    schedule_root_name: document.getElementById("schRootName").value || "",
-  };
-  const r = await fetch("/api/schedule",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(x=>x.json());
-  show("schMsg", r.ok ? "定时设置已保存" : ("保存失败："+(r.error||"")), r.ok?"ok":"err");
-  if(r.ok){ loadSchedule(); pollSchedule(); }
+async function loadCas(){
+  const j = await fetch('/api/cas/status').then(r=>r.json())
+  $('casPill').textContent = j.enabled ? `已启用 · 待清理 ${j.pending_cleanup||0}` : '未启用'
+}
+async function casPurge(){
+  if (!confirm('立即清空残留临时文件？')) return
+  const j = await fetch('/api/cas/purge',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(r=>r.json())
+  if (j.ok) { loadCas(); alert('已清理 '+j.deleted+' 个临时文件') } else alert('失败：'+(j.error||''))
 }
 
-async function runScheduleNow(){
-  const r = await fetch("/api/schedule/now",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(x=>x.json());
-  if(!r.ok){ show("schMsg", r.error||"启动失败", "err"); return; }
-  show("schMsg","定时任务已启动…","info");
-  pollSchedule();
+// ============ 存储浏览 ============
+async function openBrowse(folder){
+  currentFolder = folder
+  const j = await fetch('/api/list?folder='+encodeURIComponent(folder)).then(r=>r.json())
+  if (!j.ok){ $('browseList').innerHTML = `<div class="empty" style="padding:24px">读取失败：${esc(j.error||'')}</div>`; return }
+  // 面包屑
+  const parts = folder.split('/').filter(Boolean)
+  let html = '<span class="crumb" onclick="openBrowse(\'/\')">根目录</span>'
+  let acc = ''
+  for (let i=0;i<parts.length;i++){
+    acc += '/'+parts[i]
+    const c = acc
+    html += ' / <span class="crumb" onclick="openBrowse(\''+c+'\')">'+esc(parts[i])+'</span>'
+  }
+  $('browsePath').innerHTML = html
+  if (!j.items || j.items.length===0){
+    $('browseList').innerHTML = '<div class="empty" style="padding:24px">此目录为空</div>'
+    $('btnNewTaskFromBrowse').style.display = folder==='/' ? 'none' : ''
+    return
+  }
+  $('browseList').innerHTML = j.items.map(it => `
+    <div class="browse-row" onclick="${it.is_folder ? `openBrowse('${esc(it.path)}')` : `alert('文件不能直接建任务，请进入它的父目录')`}">
+      <span class="ico">${it.is_folder ? '📁' : '🎬'}</span>
+      <span class="name">${esc(it.name)}</span>
+      <span class="meta">${it.is_folder ? '' : esc((it.size_human||it.size||''))}</span>
+    </div>
+  `).join('')
+  $('btnNewTaskFromBrowse').style.display = folder==='/' ? 'none' : ''
+}
+function newTaskFromBrowse(){
+  const folder = currentFolder
+  const name = folder.split('/').filter(Boolean).pop() || 'new'
+  openTaskModal()
+  $('f_name').value = name
+  $('f_folder').value = folder
+}
+function openFolderPicker(){
+  $('page-browse').classList.add('active')
+  document.querySelectorAll('.page').forEach(x=>{ if(x.id!=='page-browse') x.classList.remove('active') })
+  document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'))
+  document.querySelector('[data-page=browse]').classList.add('active')
+  openBrowse(currentFolder)
 }
 
-async function pollSchedule(){
-  const r = await fetch("/api/schedule").then(x=>x.json());
-  renderSchStatus(r);
-  if(r.running){ setTimeout(pollSchedule, 1500); }
-}
-
-load();
+// ============ 启动 ============
+loadConfig().then(()=>{loadTasks(); pollStatus(true)})
+setInterval(()=>{ if(document.querySelector('.page.active').id==='page-tasks') loadTasks() }, 15000)
 </script>
 </body>
 </html>

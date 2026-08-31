@@ -33,7 +33,7 @@ class CancelError(Exception):
 class StrmGenerator:
     def __init__(self, client, base_url, output_dir,
                  media_ext=None, copy_ext=None, min_size_mb=0,
-                 recursive=True, strip_cas=True, include_cas=True,
+                 strip_cas=True, include_cas=True,
                  force=False, delete_orphans=False):
         self.client = client
         self.base_url = base_url.rstrip("/")
@@ -41,7 +41,6 @@ class StrmGenerator:
         self.media_ext = [e.lower().lstrip(".") for e in (media_ext or DEFAULT_MEDIA_EXT)]
         self.copy_ext = [e.lower().lstrip(".") for e in (copy_ext or DEFAULT_COPY_EXT)]
         self.min_size = int(min_size_mb * 1024 * 1024)
-        self.recursive = recursive
         # 去掉 .cas 尾巴，让 Emby 看到的是 xxx.mp4 而不是 xxx.mp4.cas
         self.strip_cas = strip_cas
         # 是否把 .cas 秒传文件也生成 strm（靠 302 时秒传还原来播放）
@@ -86,28 +85,19 @@ class StrmGenerator:
         """请求终止当前生成。会在下一个检查点抛出 CancelError 中断递归。"""
         self.cancelled = True
 
-    def generate(self, folder_id="/", relative_path="", force=None, root_name=None):
-        """从指定目录开始递归生成。relative_path 为输出目录下的相对子目录。
-
-        force 为 True 时覆盖已存在的 strm（强同步）；为 None 时沿用实例自身设置。
-        root_name 非空时，把"选定目录"的名称作为输出目录的第一层（建一层壳），
-        让目录结构更清晰（如选 /电影 → 输出 /strm/电影/...）。
-        """
-        if force is not None:
-            self.force = force
+    def generate(self, folder_id="/", target_subdir=""):
+        """从指定目录开始递归生成。target_subdir 非空时，strm 落在
+        output_dir/<target_subdir>/ 下（用作任务的"壳目录"）；空时直接落在 output_dir 下。"""
         if self.cancelled:
             raise CancelError("生成已被手动终止")
-        # 仅顶层生效：把选定目录名套成输出第一层；递归调用时 relative_path 已非空、root_name 为 None
-        if root_name and relative_path == "":
-            relative_path = sanitize_name(root_name)
         try:
             items = self.client.list_files(folder_id)
         except Yun139Error as exc:
-            self.errors.append(f"列出目录失败 {relative_path or '/'}: {exc}")
+            self.errors.append(f"列出目录失败 {target_subdir or '/'}: {exc}")
             self.log(f"列出目录失败: {exc}")
             return
 
-        target_dir = os.path.join(self.output_dir, relative_path) if relative_path else self.output_dir
+        target_dir = os.path.join(self.output_dir, target_subdir) if target_subdir else self.output_dir
         os.makedirs(target_dir, exist_ok=True)
         self._touched_dirs.add(os.path.abspath(target_dir))
 
@@ -115,10 +105,8 @@ class StrmGenerator:
             if self.cancelled:
                 raise CancelError("生成已被手动终止")
             if item.is_folder:
-                if self.recursive:
-                    sub = os.path.join(relative_path, sanitize_name(item.name)) if relative_path \
-                        else sanitize_name(item.name)
-                    self.generate(item.file_id, sub)
+                sub = sanitize_name(item.name)
+                self.generate(item.file_id, os.path.join(target_subdir, sub) if target_subdir else sub)
                 continue
 
             if self.is_media(item.name):

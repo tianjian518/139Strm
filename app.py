@@ -50,13 +50,6 @@ _task_state = {
 _task_lock = threading.Lock()
 _current_gen = None            # 当前正在运行的 StrmGenerator 实例，供 stop 接口中断
 
-# 定时同步运行状态（与单次手动任务分开记录）
-_schedule_meta = {
-    "last_run_at": None,
-    "last_result": None,
-    "next_run_at": None,
-}
-
 
 # ----------------------------------------------------------------------
 # 配置
@@ -70,27 +63,16 @@ DEFAULT_CONFIG = {
     "cloud_id": "",
     "output_dir": "/strm",
     "base_url": "",            # 留空则自动取请求中的 Host
+    # ---- STRM 默认设置（任务未指定时使用） ----
     "media_ext": DEFAULT_MEDIA_EXT,
     "copy_ext": DEFAULT_COPY_EXT,
     "min_size_mb": 0,
-    "recursive": True,
+    "url_encode": True,        # strm 内 URL 是否编码（兼容中文路径）
     # ---- CAS 秒传还原 ----
     "cas_enabled": True,       # 是否对 .cas 文件做秒传还原播放
     "cas_temp_ttl": 300,       # 还原出的临时文件保留秒数后自动删除
     "cas_allow_all_ext": False,  # False=只还原视频；True=任何后缀都还原
     "cas_temp_dir_id": "",     # 记住临时目录 ID，避免重启后重复创建
-    # ---- 同步模式 ----
-    "sync_mode": "incremental",  # incremental=跳过已生成；force=全量覆盖重新生成
-    "keep_root": True,           # 生成时在输出目录保留"选定目录"这一层（结构更清晰）
-    # ---- 定时同步 ----
-    "schedule_enabled": False,
-    "schedule_kind": "off",       # off / daily / interval
-    "schedule_hour": 3,
-    "schedule_minute": 0,
-    "schedule_interval_hours": 6,
-    "schedule_folder": "/",
-    "schedule_sync_mode": "incremental",
-    "schedule_root_name": "",     # 定时任务套壳用的目录名（留空则不套壳）
 }
 
 
@@ -249,7 +231,7 @@ def api_save_config():
                 val = [x.strip().lstrip(".") for x in val.split(",") if x.strip()]
             if key == "min_size_mb":
                 val = float(val or 0)
-            if key == "recursive":
+            if key == "url_encode":
                 val = bool(val)
             cfg[key] = val
     # 空字符串表示不修改已有凭据
@@ -320,11 +302,13 @@ def api_list():
 # STRM 生成
 # ----------------------------------------------------------------------
 
-def run_strm_job(cfg, folder, force=None, fallback_host=""):
+def run_strm_job(cfg, folder, target_subdir="", force=None, fallback_host=""):
     """
-    真正执行一次 STRM 生成（手动 / 任务 / 定时都会走到这里）。
+    真正执行一次 STRM 生成（手动 / 任务 / 调度都会走到这里）。
 
     所有生成选项都从 cfg 读取（调用方负责把全局配置与任务选项合并好）。
+    target_subdir：输出子目录名（任务名 sanitize 后的壳目录），顶层调用传
+    "" 时 strs 直接落在 output_dir 下；非空时 strs 落在 output_dir/<target_subdir>/ 下。
     返回 summary 字典；任何异常都被包成 summary，不会向外抛，避免后台线程静默崩溃。
     """
     try:
@@ -338,16 +322,11 @@ def run_strm_job(cfg, folder, force=None, fallback_host=""):
         if force is None:
             force = (cfg.get("sync_mode") or "incremental") == "force"
         delete_orphans = bool(cfg.get("delete_orphans", force))
-        keep_root = cfg.get("keep_root", True)
-        root_name = cfg.get("root_name") or None
-        if not keep_root or not root_name:
-            root_name = None
         gen = StrmGenerator(
             client=client, base_url=base_url,
             output_dir=cfg.get("output_dir") or "/strm",
             media_ext=cfg.get("media_ext"), copy_ext=cfg.get("copy_ext"),
             min_size_mb=float(cfg.get("min_size_mb", 0) or 0),
-            recursive=bool(cfg.get("recursive", True)),
             include_cas=bool(cfg.get("cas_enabled", True)),
             force=bool(force),
             delete_orphans=delete_orphans,
@@ -356,7 +335,7 @@ def run_strm_job(cfg, folder, force=None, fallback_host=""):
         with _task_lock:
             _current_gen = gen
         try:
-            gen.generate(folder, "", root_name=root_name)
+            gen.generate(folder, target_subdir=target_subdir)
             gen.clean_orphans()
         except CancelError:
             return {**gen.summary(), "cancelled": True}
@@ -377,14 +356,26 @@ def run_strm_job(cfg, folder, force=None, fallback_host=""):
 
 
 def _task_to_job(task, cfg):
-    """把一个任务（或单次请求的选项）合并进全局配置，得到一次生成用的 job。"""
+    """把一个任务合并进全局配置，得到一次生成用的 job。"""
     job_cfg = dict(cfg)
-    for k in ("sync_mode", "delete_orphans", "keep_root", "root_name",
-              "recursive", "min_size_mb", "media_ext", "copy_ext"):
-        if task.get(k) is not None:
-            job_cfg[k] = task[k]
+    # 任务级字段：未提供则沿用全局配置
+    for k, cast in (
+        ("sync_mode", lambda v: v if v in ("incremental", "force") else None),
+        ("delete_orphans", lambda v: bool(v)),
+        ("media_ext", lambda v: v if v else None),
+        ("copy_ext", lambda v: v if v else None),
+        ("min_size_mb", lambda v: float(v) if v not in (None, "") else None),
+    ):
+        v = task.get(k)
+        if v is not None and v != "":
+            cv = cast(v) if k != "sync_mode" else v
+            if cv is not None:
+                job_cfg[k] = cv
+    # 输出子目录 = 任务名 sanitize（套壳天然开启；想要去掉套壳就把 task.cron_empty=False 也行
+    # 但与 Smart 心智一致，强制套壳，零配置）
+    sub = sanitize_name(task.get("name") or "")
     return {"name": task.get("name", "任务"), "folder": task.get("folder", "/"),
-            "cfg": job_cfg}
+            "subdir": sub, "cfg": job_cfg}
 
 
 def _claim_running():
@@ -426,10 +417,13 @@ def _enqueue_jobs(jobs):
                 try:
                     summary = run_strm_job(
                         job["cfg"], job["folder"],
+                        target_subdir=job.get("subdir", ""),
                         fallback_host=job["cfg"].get("base_url") or "")
-                    res = {"name": job["name"], "folder": job["folder"], "summary": summary}
+                    res = {"name": job["name"], "folder": job["folder"],
+                           "task_id": job.get("task_id"), "summary": summary}
                 except Exception as exc:
                     res = {"name": job["name"], "folder": job["folder"],
+                           "task_id": job.get("task_id"),
                            "summary": {"errors": [f"{type(exc).__name__}: {exc}"]}}
                 with _task_lock:
                     _task_state["results"].append(res)
@@ -437,6 +431,22 @@ def _enqueue_jobs(jobs):
                     if _task_state.get("stop_requested"):
                         _task_state["progress"] = "已手动终止"
                         break
+                # 把这次运行结果写回对应任务记录（last_run_at / last_summary / 下次运行）
+                if job.get("task_id"):
+                    try:
+                        ts = load_tasks()
+                        now = datetime.now()
+                        for tt in ts:
+                            if tt["id"] == job["task_id"]:
+                                tt["last_run_at"] = now.isoformat()
+                                tt["last_summary"] = res["summary"]
+                                if tt.get("cron"):
+                                    nxt = _next_run_from_cron(tt["cron"], now)
+                                    tt["next_run_at"] = nxt.isoformat() if nxt else None
+                                break
+                        save_tasks(ts)
+                    except Exception:
+                        pass
         finally:
             with _task_lock:
                 _task_state["running"] = False
@@ -465,7 +475,6 @@ def api_create_task():
     data = request.get_json(force=True) or {}
     name = (data.get("name") or "").strip()
     folder = data.get("folder") or "/"
-    folder_name = (data.get("folder_name") or name).strip()
     if not name:
         return jsonify({"ok": False, "error": "任务名不能为空"}), 400
     if not folder:
@@ -473,21 +482,24 @@ def api_create_task():
     sync_mode = data.get("sync_mode") or "incremental"
     if sync_mode not in ("incremental", "force"):
         sync_mode = "incremental"
+    cron = (data.get("cron") or "").strip()
+    if cron and not _is_valid_cron(cron):
+        return jsonify({"ok": False, "error": f"无效的 crontab 表达式: {cron}"}), 400
     tasks = load_tasks()
     task = {
         "id": uuid.uuid4().hex[:12],
         "name": name,
         "folder": folder,
-        "folder_name": folder_name,
-        "enabled": True,
+        "enabled": True if data.get("enabled") is None else bool(data.get("enabled")),
+        "cron": cron,
         "sync_mode": sync_mode,
         "delete_orphans": bool(data.get("delete_orphans", sync_mode == "force")),
-        "keep_root": bool(data.get("keep_root", True)),
-        "root_name": data.get("root_name") or folder_name,
-        "recursive": bool(data.get("recursive", True)),
-        "min_size_mb": float(data.get("min_size_mb") or 0),
         "media_ext": data.get("media_ext") or None,
         "copy_ext": data.get("copy_ext") or None,
+        "min_size_mb": (float(data.get("min_size_mb")) if data.get("min_size_mb") not in (None, "") else None),
+        "last_run_at": None,
+        "last_summary": None,
+        "next_run_at": _next_run_from_cron(cron, datetime.now()).isoformat() if cron else None,
         "created_at": datetime.now().isoformat(),
     }
     tasks.append(task)
@@ -501,21 +513,32 @@ def api_update_task(task_id):
     tasks = load_tasks()
     for t in tasks:
         if t["id"] == task_id:
-            for k in ("name", "folder", "folder_name", "enabled", "sync_mode",
-                      "delete_orphans", "keep_root", "root_name", "recursive",
-                      "min_size_mb", "media_ext", "copy_ext"):
+            for k in ("name", "folder", "enabled", "cron", "sync_mode",
+                      "delete_orphans", "media_ext", "copy_ext", "min_size_mb"):
                 if k not in data:
                     continue
                 v = data[k]
-                if k in ("enabled", "delete_orphans", "keep_root", "recursive"):
-                    v = bool(v)
+                if k == "cron":
+                    v = str(v or "").strip()
+                    if v and not _is_valid_cron(v):
+                        return jsonify({"ok": False, "error": f"无效的 crontab 表达式: {v}"}), 400
+                    t["cron"] = v
+                    t["next_run_at"] = _next_run_from_cron(v, datetime.now()).isoformat() if v else None
+                elif k == "enabled":
+                    t["enabled"] = bool(v)
+                elif k == "delete_orphans":
+                    t["delete_orphans"] = bool(v)
                 elif k == "sync_mode":
-                    v = v if v in ("incremental", "force") else t.get("sync_mode")
+                    if v in ("incremental", "force"):
+                        t["sync_mode"] = v
+                elif k in ("media_ext", "copy_ext"):
+                    if isinstance(v, str):
+                        v = [x.strip().lstrip(".") for x in v.split(",") if x.strip()] or None
+                    t[k] = v or None
                 elif k == "min_size_mb":
-                    v = float(v or 0)
-                elif k in ("media_ext", "copy_ext") and isinstance(v, str):
-                    v = [x.strip().lstrip(".") for x in v.split(",") if x.strip()] or None
-                t[k] = v
+                    t["min_size_mb"] = (float(v) if v not in (None, "") else None)
+                else:
+                    t[k] = v
             save_tasks(tasks)
             return jsonify({"ok": True, "task": t})
     return jsonify({"ok": False, "error": "任务不存在"}), 404
@@ -534,7 +557,7 @@ def api_delete_task(task_id):
     if bool(data.get("clean_output")) and target:
         cfg = load_config()
         out = cfg.get("output_dir") or "/strm"
-        shell = sanitize_name(target.get("root_name") or target.get("folder_name") or "")
+        shell = sanitize_name(target.get("name") or "")
         if shell:
             import shutil
             d = os.path.join(out, shell)
@@ -552,7 +575,11 @@ def api_run_all_tasks():
     tasks = [t for t in load_tasks() if t.get("enabled", True)]
     if not tasks:
         return jsonify({"ok": False, "error": "没有已启用的任务"}), 400
-    jobs = [_task_to_job(t, cfg) for t in tasks]
+    jobs = []
+    for t in tasks:
+        job = _task_to_job(t, cfg)
+        job["task_id"] = t["id"]
+        jobs.append(job)
     if not _enqueue_jobs(jobs):
         return jsonify({"ok": False, "error": "已有任务正在运行"}), 409
     return jsonify({"ok": True, "message": f"已启动 {len(jobs)} 个任务"})
@@ -565,8 +592,9 @@ def api_run_one_task(task_id):
     task = next((t for t in tasks if t["id"] == task_id), None)
     if not task:
         return jsonify({"ok": False, "error": "任务不存在"}), 404
-    jobs = [_task_to_job(task, cfg)]
-    if not _enqueue_jobs(jobs):
+    job = _task_to_job(task, cfg)
+    job["task_id"] = task["id"]
+    if not _enqueue_jobs([job]):
         return jsonify({"ok": False, "error": "已有任务正在运行"}), 409
     return jsonify({"ok": True, "message": "已启动任务"})
 
@@ -586,23 +614,27 @@ def api_stop_tasks():
 
 @app.route("/api/strm", methods=["POST"])
 def api_strm():
-    """兼容旧的一次性生成：构建一个临时 job 走队列（不保存为任务）。"""
+    """兼容旧的一次性生成：构造一个临时 job 走队列（不保存为任务）。
+    v2.1 起建议直接用 /api/tasks/<id>/run。"""
     data = request.get_json(force=True) or {}
     cfg = load_config()
     if data.get("base_url"):
         cfg["base_url"] = data["base_url"]
     job_cfg = dict(cfg)
-    for k in ("sync_mode", "delete_orphans", "keep_root", "root_name",
-              "recursive", "min_size_mb", "media_ext", "copy_ext"):
+    for k in ("sync_mode", "delete_orphans", "media_ext", "copy_ext", "min_size_mb"):
         if k in data:
             v = data[k]
-            if k in ("delete_orphans", "keep_root", "recursive"):
+            if k == "delete_orphans":
                 v = bool(v)
             elif k == "min_size_mb":
-                v = float(v or 0)
+                v = float(v) if v not in (None, "") else None
+            elif k in ("media_ext", "copy_ext") and isinstance(v, str):
+                v = [x.strip().lstrip(".") for x in v.split(",") if x.strip()] or None
             job_cfg[k] = v
     folder = data.get("folder", "/")
-    job = {"name": "手动生成", "folder": folder, "cfg": job_cfg}
+    # 一次性生成也用「子目录壳」保持一致性：取 folder 末段 sanitize
+    sub = sanitize_name(folder.rstrip("/").split("/")[-1] or "manual")
+    job = {"name": "手动生成", "folder": folder, "subdir": sub, "cfg": job_cfg}
     if not _enqueue_jobs([job]):
         return jsonify({"ok": False, "error": "已有任务正在运行"}), 409
     return jsonify({"ok": True, "message": "任务已启动"})
@@ -711,81 +743,123 @@ def api_link(file_id):
 
 
 # ----------------------------------------------------------------------
-# 定时同步调度器（仅用标准库，无额外依赖）
+# Crontab 解析（仅支持 5 字段标准格式：分 时 日 月 周）
 # ----------------------------------------------------------------------
 
-def _compute_next_run(cfg, now):
-    """计算下一次定时运行的本地时间（无下次则返回 None）。"""
-    from datetime import timedelta
-    kind = cfg.get("schedule_kind")
-    if kind == "daily":
-        try:
-            h = int(cfg.get("schedule_hour") or 3)
-            m = int(cfg.get("schedule_minute") or 0)
-        except (TypeError, ValueError):
-            h, m = 3, 0
-        cand = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if cand <= now:
-            cand += timedelta(days=1)
-        return cand
-    if kind == "interval":
-        try:
-            iv = max(1, int(cfg.get("schedule_interval_hours") or 6))
-        except (TypeError, ValueError):
-            iv = 6
-        last = _schedule_meta.get("last_run_at")
-        if last:
+def _expand_cron_field(field, lo, hi):
+    """把 crontab 的单个字段展开成允许的整数集合。支持 *, a-b, a,b,c, /step。"""
+    result = set()
+    for part in field.split(","):
+        step = 1
+        if "/" in part:
+            base, step_s = part.split("/", 1)
             try:
-                last_dt = datetime.fromisoformat(last) if isinstance(last, str) else last
-            except (ValueError, TypeError):
-                last_dt = None
-            if last_dt:
-                cand = last_dt + timedelta(hours=iv)
-                return cand if cand > now else now
-        return now
+                step = max(1, int(step_s))
+            except ValueError:
+                continue
+        else:
+            base = part
+        if base in ("*", ""):
+            start, end = lo, hi
+        elif "-" in base:
+            a, b = base.split("-", 1)
+            try:
+                start = int(a); end = int(b)
+            except ValueError:
+                continue
+        else:
+            try:
+                v = int(base)
+            except ValueError:
+                continue
+            if step == 1 and "/" not in part:
+                result.add(v)
+                continue
+            start, end = (v, hi) if "-" not in base else (start, end)
+        for x in range(int(start), int(end) + 1, step):
+            result.add(x)
+    return {x for x in result if lo <= x <= hi}
+
+
+def _is_valid_cron(expr):
+    parts = expr.strip().split()
+    if len(parts) != 5:
+        return False
+    for i, (lo, hi) in enumerate([(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]):
+        if not _expand_cron_field(parts[i], lo, hi):
+            return False
+    return True
+
+
+def _next_run_from_cron(expr, now):
+    """返回 expr 在 now 之后最近一次触发的 datetime；表达式空/无效返回 None。"""
+    if not expr:
+        return None
+    try:
+        parts = expr.strip().split()
+        if len(parts) != 5:
+            return None
+        mins = _expand_cron_field(parts[0], 0, 59)
+        hours = _expand_cron_field(parts[1], 0, 23)
+        doms = _expand_cron_field(parts[2], 1, 31)
+        months = _expand_cron_field(parts[3], 1, 12)
+        dows = _expand_cron_field(parts[4], 0, 6)
+    except Exception:
+        return None
+    if not (mins and hours and doms and months and dows):
+        return None
+    from datetime import timedelta
+    # 标准 crontab：dom 和 dow 是 OR 关系（任一满足即可），其它都是 AND
+    cand = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    for _ in range(60 * 24 * 366):  # 最多往后扫一年
+        if (cand.month in months
+                and (cand.day in doms or cand.weekday() in dows)  # weekday(): 周一=0
+                and cand.hour in hours
+                and cand.minute in mins):
+            return cand
+        cand += timedelta(minutes=1)
     return None
 
 
-def _run_scheduled():
-    """触发一次定时生成；统一占用 _task_state 槽位，避免与手动/任务并发。"""
-    if not _claim_running():
-        return
-    try:
-        cfg = load_config()
-        job_cfg = dict(cfg)
-        job_cfg["sync_mode"] = cfg.get("schedule_sync_mode") or "incremental"
-        force = job_cfg["sync_mode"] == "force"
-        job_cfg["delete_orphans"] = bool(cfg.get("schedule_delete_orphans", force))
-        job_cfg["keep_root"] = cfg.get("keep_root", True)
-        job_cfg["root_name"] = (cfg.get("schedule_root_name") or None) if job_cfg["keep_root"] else None
-        folder = cfg.get("schedule_folder") or "/"
-        summary = run_strm_job(job_cfg, folder, force=force,
-                               fallback_host=cfg.get("base_url") or "")
-        with _task_lock:
-            _schedule_meta["last_run_at"] = datetime.now().isoformat()
-            _schedule_meta["last_result"] = summary
-        app.logger.info("定时任务完成：%s", summary)
-    finally:
-        with _task_lock:
-            _task_state["running"] = False
+# ----------------------------------------------------------------------
+# 任务调度循环（每 30 秒扫一次，到时间的任务串行入队执行）
+# ----------------------------------------------------------------------
+
+_SCHEDULER_TICK_SEC = 30
+_last_trigger_key = {}  # task_id -> 上次触发的 cron 时间，避免同分钟内重复触发
 
 
-def _scheduler_loop():
-    """后台线程：每 15 秒检查一次是否到了运行时间。"""
+def _task_scheduler_loop():
     while True:
         try:
-            time.sleep(15)
+            time.sleep(_SCHEDULER_TICK_SEC)
             cfg = load_config()
-            if not cfg.get("schedule_enabled") or cfg.get("schedule_kind") == "off":
-                _schedule_meta["next_run_at"] = None
-                continue
+            tasks = load_tasks()
             now = datetime.now()
-            nxt = _compute_next_run(cfg, now)
-            _schedule_meta["next_run_at"] = nxt.isoformat() if nxt else None
-            if nxt and now >= nxt:
-                _run_scheduled()
+            due = []
+            for t in tasks:
+                if not t.get("enabled", True):
+                    continue
+                cron = (t.get("cron") or "").strip()
+                if not cron:
+                    continue
+                nxt = _next_run_from_cron(cron, now)
+                if not nxt:
+                    continue
+                # 是否到点：上次触发时间在 nxt 之前、现在已 >= nxt
+                last = _last_trigger_key.get(t["id"])
+                if last and nxt <= last:
+                    continue
+                if now >= nxt:
+                    due.append(t)
+                    _last_trigger_key[t["id"]] = nxt
+            if not due:
+                continue
+            # 串行入队（受 _claim_running 约束）
+            jobs = [_task_to_job(t, cfg) for t in due]
+            _enqueue_jobs(jobs)
         except Exception as exc:
-            app.logger.warning("定时调度器异常: %s", exc)
+            app.logger.warning("任务调度器异常: %s", exc)
 
 
 # ----------------------------------------------------------------------
@@ -825,69 +899,28 @@ def api_cas_purge():
 # ----------------------------------------------------------------------
 # 定时同步接口
 # ----------------------------------------------------------------------
+# （v2.1 已移除全局定时配置，改为每个任务自带 crontab 字段。历史接口保留为
+#  兼容旧版 Web UI 的 410 Gone 提示，避免旧前端误调。）
 
-@app.route("/api/schedule", methods=["GET"])
-def api_get_schedule():
-    cfg = load_config()
-    enabled = bool(cfg.get("schedule_enabled")) and cfg.get("schedule_kind") not in (None, "off")
-    nxt = _compute_next_run(cfg, datetime.now()) if enabled else None
+
+@app.route("/api/schedule", methods=["GET", "POST"])
+def api_schedule_removed():
     return jsonify({
-        "ok": True,
-        "enabled": bool(cfg.get("schedule_enabled")),
-        "kind": cfg.get("schedule_kind", "off"),
-        "hour": cfg.get("schedule_hour", 3),
-        "minute": cfg.get("schedule_minute", 0),
-        "interval_hours": cfg.get("schedule_interval_hours", 6),
-        "folder": cfg.get("schedule_folder", "/"),
-        "sync_mode": cfg.get("schedule_sync_mode", "incremental"),
-        "keep_root": cfg.get("keep_root", True),
-        "schedule_root_name": cfg.get("schedule_root_name", ""),
-        "last_run_at": _schedule_meta.get("last_run_at"),
-        "last_result": _schedule_meta.get("last_result"),
-        "next_run_at": nxt.isoformat() if nxt else None,
-        "running": _task_state["running"],
-    })
-
-
-@app.route("/api/schedule", methods=["POST"])
-def api_save_schedule():
-    cfg = load_config()
-    data = request.get_json(force=True) or {}
-    for key in ("schedule_enabled", "schedule_kind", "schedule_hour",
-                "schedule_minute", "schedule_interval_hours",
-                "schedule_folder", "schedule_sync_mode", "schedule_root_name"):
-        if key not in data:
-            continue
-        val = data[key]
-        if key == "schedule_enabled":
-            val = bool(val)
-        elif key == "schedule_kind":
-            val = val if val in ("off", "daily", "interval") else "off"
-        elif key == "schedule_sync_mode":
-            val = val if val in ("incremental", "force") else "incremental"
-        elif key == "schedule_root_name":
-            val = str(val or "")
-        elif key in ("schedule_hour", "schedule_minute", "schedule_interval_hours"):
-            try:
-                val = int(val)
-            except (TypeError, ValueError):
-                continue
-        cfg[key] = val
-    save_config(cfg)
-    return jsonify({"ok": True})
+        "ok": False,
+        "error": "全局定时配置已移除（v2.1），请在「任务管理」里给单个任务设置 crontab",
+    }), 410
 
 
 @app.route("/api/schedule/now", methods=["POST"])
-def api_run_schedule_now():
-    with _task_lock:
-        if _task_state["running"]:
-            return jsonify({"ok": False, "error": "已有任务正在运行"}), 409
-    threading.Thread(target=_run_scheduled, daemon=True).start()
-    return jsonify({"ok": True, "message": "定时任务已启动"})
+def api_schedule_now_removed():
+    return jsonify({
+        "ok": False,
+        "error": "全局定时配置已移除（v2.1），请直接「运行」某个任务",
+    }), 410
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8025))
-    threading.Thread(target=_scheduler_loop, name="139strm-scheduler",
+    threading.Thread(target=_task_scheduler_loop, name="139strm-task-scheduler",
                      daemon=True).start()
     app.run(host="0.0.0.0", port=port, threaded=True)
