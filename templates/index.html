@@ -262,7 +262,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
       <div class="card">
         <div class="browse-path" id="browsePath"></div>
         <div class="browse-list" id="browseList">
-          <div class="empty" style="padding:24px">登录后点「↻ 进入根目录」开始浏览</div>
+          <div class="empty" style="padding:24px">点左侧「存储浏览」开始浏览（需先在存储管理里填好 Authorization）</div>
         </div>
       </div>
     </section>
@@ -361,11 +361,13 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
     <label>任务名称 <span class="hint" style="display:inline;font-weight:400">（输出到 <span class="cr">/strm/&lt;任务名&gt;</span>，仅做展示用）</span></label>
     <input id="f_name" type="text" placeholder="例：movie">
 
-    <label>扫描路径 <span class="hint" style="display:inline;font-weight:400">（云盘里的目录）</span></label>
+    <label>扫描目录 <span class="hint" style="display:inline;font-weight:400">（在云盘里点「浏览」逐级选，不要手填）</span></label>
     <div style="display:flex;gap:8px">
-      <input id="f_folder" type="text" placeholder="/video/movie">
+      <input id="f_folder" type="text" placeholder="点右侧「浏览」选择目录" readonly style="background:#f8fafc">
       <button class="btn sec" onclick="openFolderPicker()">📂 浏览</button>
     </div>
+    <input id="f_folder_path" type="hidden">
+    <div class="hint" id="f_folder_tip" style="margin:-2px 0 6px">未选择目录</div>
 
     <div class="row">
       <div>
@@ -450,7 +452,7 @@ document.querySelectorAll('#nav .nav-item').forEach(el=>{
     document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'))
     el.classList.add('active')
     $('page-'+el.dataset.page).classList.add('active')
-    if (el.dataset.page==='browse') openBrowse('/')
+    if (el.dataset.page==='browse'){ browseStack=[{id:'/',name:'根目录'}]; openBrowse('/') }
     if (el.dataset.page==='storage') loadConfig()
     if (el.dataset.page==='settings') { loadConfig(); loadCas() }
     if (el.dataset.page==='tasks') loadTasks()
@@ -472,7 +474,7 @@ async function loadTasks(){
     <tr>
       <td><b>${esc(t.name)}</b>${t.enabled===false?'':'<br><span class="pill p-ok" style="font-size:11px">启用</span>'}</td>
       <td><span class="mono">移动云盘</span></td>
-      <td class="mono">${esc(t.folder)}</td>
+      <td class="mono" title="目录 ID：${esc(t.folder)}">${esc(t.folder_path || t.folder)}</td>
       <td>${t.cron ? `<span class="cr">${esc(t.cron)}</span>` : '<span class="pill p-off">未设置</span>'}</td>
       <td class="mono">${t.cron ? fmtDate(t.next_run_at) : '—'}</td>
       <td>
@@ -497,6 +499,8 @@ function openTaskModal(id){
       const t = j.tasks.find(x=>x.id===id); if(!t) return
       $('f_name').value = t.name
       $('f_folder').value = t.folder
+      $('f_folder_path').value = t.folder_path || ''
+      $('f_folder_tip').textContent = t.folder_path ? ('已选择：'+t.folder_path) : ('目录 ID：'+t.folder)
       $('f_sync').value = t.sync_mode || 'incremental'
       $('f_delorph').checked = !!t.delete_orphans
       $('f_mediaext').value = (t.media_ext||[]).join(',')
@@ -505,7 +509,8 @@ function openTaskModal(id){
       $('f_cron').value = t.cron || ''
     })
   } else {
-    ['f_name','f_folder','f_mediaext','f_copyext','f_cron'].forEach(k=>$(k).value='')
+    ['f_name','f_folder','f_folder_path','f_mediaext','f_copyext','f_cron'].forEach(k=>$(k).value='')
+    $('f_folder_tip').textContent = '未选择目录'
     $('f_minsize').value = ''
     $('f_sync').value = 'incremental'
     $('f_delorph').checked = true
@@ -518,6 +523,7 @@ async function saveTask(){
   const body = {
     name: $('f_name').value.trim(),
     folder: $('f_folder').value.trim() || '/',
+    folder_path: $('f_folder_path').value.trim(),
     sync_mode: $('f_sync').value,
     delete_orphans: $('f_delorph').checked,
     media_ext: $('f_mediaext').value.trim() || null,
@@ -526,7 +532,7 @@ async function saveTask(){
     cron: $('f_cron').value.trim(),
   }
   if (!body.name){ show('taskMsg','err','任务名不能为空'); return }
-  if (!body.folder){ show('taskMsg','err','请选择扫描路径'); return }
+  if (!body.folder || body.folder === '/'){ show('taskMsg','err','请点「浏览」选择要扫描的目录'); return }
   const url = editingId ? `/api/tasks/${editingId}` : '/api/tasks'
   const method = editingId ? 'PUT' : 'POST'
   const r = await fetch(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json())
@@ -675,46 +681,86 @@ async function casPurge(){
 }
 
 // ============ 存储浏览 ============
+// 移动云盘是按「目录 ID」列目录的，没有真正的路径概念。
+// 所以这里自己维护一条面包屑栈 browseStack=[{id,name}...]，
+// 点子目录时把它的 file_id 压栈回传，点面包屑时截断栈跳回去。
+let browseStack = [{id:'/', name:'根目录'}]
+let browseItems = []
+
+function browseDisplayPath(){
+  return browseStack.map(s=>s.name).join(' / ')
+}
+function renderBrowsePath(){
+  $('browsePath').innerHTML = browseStack.map((s,i)=>
+    i===browseStack.length-1
+      ? `<span>${esc(s.name)}</span>`
+      : `<span class="crumb" onclick="gotoCrumb(${i})">${esc(s.name)}</span>`
+  ).join(' <span style="color:#cbd5e1">/</span> ')
+}
 async function openBrowse(folder){
   currentFolder = folder
-  const j = await fetch('/api/list?folder='+encodeURIComponent(folder)).then(r=>r.json())
-  if (!j.ok){ $('browseList').innerHTML = `<div class="empty" style="padding:24px">读取失败：${esc(j.error||'')}</div>`; return }
-  // 面包屑
-  const parts = folder.split('/').filter(Boolean)
-  let html = '<span class="crumb" onclick="openBrowse(\'/\')">根目录</span>'
-  let acc = ''
-  for (let i=0;i<parts.length;i++){
-    acc += '/'+parts[i]
-    const c = acc
-    html += ' / <span class="crumb" onclick="openBrowse(\''+c+'\')">'+esc(parts[i])+'</span>'
-  }
-  $('browsePath').innerHTML = html
-  if (!j.items || j.items.length===0){
-    $('browseList').innerHTML = '<div class="empty" style="padding:24px">此目录为空</div>'
-    $('btnNewTaskFromBrowse').style.display = folder==='/' ? 'none' : ''
+  $('browseList').innerHTML = '<div class="empty" style="padding:24px">读取中…</div>'
+  let j
+  try {
+    j = await fetch('/api/list?folder='+encodeURIComponent(folder)).then(r=>r.json())
+  } catch(e){
+    $('browseList').innerHTML = `<div class="empty" style="padding:24px">请求失败：${esc(e)}</div>`
     return
   }
-  $('browseList').innerHTML = j.items.map(it => `
-    <div class="browse-row" onclick="${it.is_folder ? `openBrowse('${esc(it.path)}')` : `alert('文件不能直接建任务，请进入它的父目录')`}">
+  if (!j.ok){
+    $('browseList').innerHTML = `<div class="empty" style="padding:24px">读取失败：${esc(j.error||'未知错误')}</div>`
+    return
+  }
+  browseItems = j.items || []
+  renderBrowsePath()
+  $('btnNewTaskFromBrowse').style.display = folder==='/' ? 'none' : ''
+  if (browseItems.length===0){
+    $('browseList').innerHTML = '<div class="empty" style="padding:24px">此目录为空</div>'
+    return
+  }
+  $('browseList').innerHTML = browseItems.map((it,i) => `
+    <div class="browse-row" onclick="${it.is_folder ? `enterDir(${i})` : `pickFile(${i})`}">
       <span class="ico">${it.is_folder ? '📁' : '🎬'}</span>
       <span class="name">${esc(it.name)}</span>
-      <span class="meta">${it.is_folder ? '' : esc((it.size_human||it.size||''))}</span>
+      <span class="meta">${it.is_folder ? '进入' : esc(it.size_human||'')}</span>
     </div>
   `).join('')
-  $('btnNewTaskFromBrowse').style.display = folder==='/' ? 'none' : ''
+}
+function enterDir(i){
+  const it = browseItems[i]
+  if (!it) return
+  browseStack.push({id: it.file_id, name: it.name})
+  openBrowse(it.file_id)
+}
+function gotoCrumb(i){
+  browseStack = browseStack.slice(0, i+1)
+  openBrowse(browseStack[i].id)
+}
+function pickFile(i){
+  alert('任务要建在「目录」上，不能建在单个文件上。\n请回到它的父目录，再点「在此目录新建任务」。')
 }
 function newTaskFromBrowse(){
-  const folder = currentFolder
-  const name = folder.split('/').filter(Boolean).pop() || 'new'
+  if (currentFolder==='/'){
+    alert('请先进到一个子目录，再建任务。')
+    return
+  }
+  const name = browseStack[browseStack.length-1].name || 'new'
   openTaskModal()
   $('f_name').value = name
-  $('f_folder').value = folder
+  $('f_folder').value = currentFolder
+  $('f_folder_path').value = browseDisplayPath()
+  $('f_folder_tip').textContent = '已选择：' + browseDisplayPath()
 }
 function openFolderPicker(){
   $('page-browse').classList.add('active')
   document.querySelectorAll('.page').forEach(x=>{ if(x.id!=='page-browse') x.classList.remove('active') })
   document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'))
   document.querySelector('[data-page=browse]').classList.add('active')
+  // 模态里还没选过目录时，从根目录重新开始选
+  if (!$('f_folder').value || $('f_folder').value === '/'){
+    browseStack = [{id:'/', name:'根目录'}]
+    currentFolder = '/'
+  }
   openBrowse(currentFolder)
 }
 

@@ -279,18 +279,40 @@ def api_test():
 # 浏览
 # ----------------------------------------------------------------------
 
+def _human_size(num):
+    num = float(num or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if num < 1024 or unit == "TB":
+            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.1f} {unit}"
+        num /= 1024.0
+    return f"{num:.1f} TB"
+
+
 @app.route("/api/list")
 def api_list():
+    """
+    列目录。folder 传的是移动云盘的「目录 ID」，不传（或传 / 空）表示根目录。
+    子目录往下钻时，前端把上一级的 file_id 原样回传即可。
+    """
     cfg = load_config()
-    folder = request.args.get("folder", "/")
+    folder = (request.args.get("folder") or "/").strip() or "/"
     try:
         client = build_client(cfg)
         client.init()
+        is_root = folder in ("", "/") or folder == client.root_folder_id
         items = client.list_files(folder)
+        # 目录排前面，同类型按名称排序，方便找
+        items.sort(key=lambda x: (not x.is_folder, x.name.lower()))
+        out = []
+        for it in items:
+            d = it.to_dict()
+            d["size_human"] = "" if it.is_folder else _human_size(it.size)
+            out.append(d)
         return jsonify({
             "ok": True,
             "folder": folder,
-            "items": [it.to_dict() for it in items],
+            "is_root": is_root,
+            "items": out,
         })
     except Yun139Error as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -455,7 +477,14 @@ def _enqueue_jobs(jobs):
                     _task_state["progress"] = "已手动终止"
                     _task_state["stop_requested"] = False
                 else:
-                    _task_state["progress"] = "全部完成"
+                    failed = sum(1 for r in _task_state["results"]
+                                 if (r.get("summary") or {}).get("errors"))
+                    if failed:
+                        _task_state["progress"] = (
+                            f"跑完 {len(_task_state['results'])} 个任务，"
+                            f"其中 {failed} 个报错（点 📋 看日志）")
+                    else:
+                        _task_state["progress"] = "全部完成"
 
     threading.Thread(target=worker, daemon=True).start()
     return True
@@ -489,7 +518,10 @@ def api_create_task():
     task = {
         "id": uuid.uuid4().hex[:12],
         "name": name,
+        # folder 存的是移动云盘的「目录 ID」（list_files 拿它当 parentFileId 用），
+        # folder_path 只是给人看的路径文字，不参与列目录。
         "folder": folder,
+        "folder_path": (data.get("folder_path") or "").strip(),
         "enabled": True if data.get("enabled") is None else bool(data.get("enabled")),
         "cron": cron,
         "sync_mode": sync_mode,
@@ -513,7 +545,7 @@ def api_update_task(task_id):
     tasks = load_tasks()
     for t in tasks:
         if t["id"] == task_id:
-            for k in ("name", "folder", "enabled", "cron", "sync_mode",
+            for k in ("name", "folder", "folder_path", "enabled", "cron", "sync_mode",
                       "delete_orphans", "media_ext", "copy_ext", "min_size_mb"):
                 if k not in data:
                     continue
