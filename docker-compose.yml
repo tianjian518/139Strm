@@ -1,7 +1,7 @@
 name: 139strm
 services:
   139strm:
-    image: tianjian518/139strm:2.1      # 本地构建请把这行换成：build: .
+    build: .                            # 从源码构建，确保用到最新修复（v2.1.1）；如需固定镜像请改回 image: tianjian518/139strm:2.1
     container_name: 139strm
     restart: unless-stopped
     ports:

@@ -1,7 +1,7 @@
 name: 139strm
 services:
   139strm:
-    image: tianjian518/139strm:2.1
+    build: .                            # 从源码构建，确保用到最新修复（v2.1.1）；如需固定镜像请改回 image: tianjian518/139strm:2.1
     container_name: 139strm
     restart: unless-stopped
     # host 网络：与 Smart 一致，便于同机部署的 Emby/Jellyfin 直连 8025。
