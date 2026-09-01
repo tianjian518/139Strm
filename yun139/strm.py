@@ -65,6 +65,8 @@ class StrmGenerator:
         self._produced = set()
         # 本次递归触及的输出目录（删除孤儿时只在这些目录内清理，避免误删其他来源）
         self._touched_dirs = set()
+        # 本任务的输出根目录（output_dir/<任务名>），孤儿清理只在这个范围内递归
+        self._job_root = None
 
     def log(self, msg):
         line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -99,6 +101,9 @@ class StrmGenerator:
 
         target_dir = os.path.join(self.output_dir, target_subdir) if target_subdir else self.output_dir
         os.makedirs(target_dir, exist_ok=True)
+        # 顶层调用时记下本任务的输出根目录，孤儿清理只在这个范围内递归
+        if self._job_root is None:
+            self._job_root = os.path.abspath(target_dir)
         self._touched_dirs.add(os.path.abspath(target_dir))
 
         for item in items:
@@ -117,15 +122,19 @@ class StrmGenerator:
                 self.skipped += 1
 
     def _make_strm(self, item, target_dir):
-        if 0 < self.min_size and item.size < self.min_size:
-            self.skipped += 1
-            return
-
         raw_name = item.name
         is_cas = raw_name.lower().endswith(".cas")
         name = raw_name[:-4] if (self.strip_cas and is_cas) else raw_name
         safe = sanitize_name(name)
         strm_path = os.path.join(target_dir, safe + ".strm")
+
+        # 小于最小体积阈值：不生成。但本地若已有同名 strm，必须记为"已产出"保留下来，
+        # 否则孤儿清理会把它当成"云端源文件已删除"给误删掉。
+        if 0 < self.min_size and item.size < self.min_size:
+            self.skipped += 1
+            if os.path.exists(strm_path):
+                self._produced.add(os.path.abspath(strm_path))
+            return
 
         exists = os.path.exists(strm_path)
         # 增量模式（默认）：同名 strm 已存在就跳过（源头仍在，记录为已产出）
@@ -174,15 +183,27 @@ class StrmGenerator:
             self.errors.append(f"下载失败 {safe}: {exc}")
 
     def clean_orphans(self):
-        """扫描结束后，删除本次同步范围内、源头已不存在的 .strm（仅限 .strm）。
+        """扫描结束后，删除本任务输出目录里、云端源文件已不存在的 .strm（仅限 .strm）。
 
-        删除范围严格限定在 self._touched_dirs（本次递归触及的输出目录），
-        不会动其他来源的 strm，也不会删字幕/图片等附属文件。
+        判断依据：本次扫描中云端仍存在的视频文件，其 strm 都记在 self._produced。
+        本地还在、但不在这个清单里的 .strm，说明云端对应的原视频已经没了
+        （单个文件被删，或者整个子目录被删），于是跟着删掉。
+
+        递归范围是本任务的输出根目录（output_dir/<任务名>），这样云端删掉整个子目录时，
+        本地对应的子目录同样能清干净——只扫"本次触及的目录"做不到这一点。
+        不会动其他任务的目录，也不会删字幕/图片等附属文件。
         仅当 delete_orphans=True 时调用。
         """
         if not self.delete_orphans:
             return
-        for d in sorted(self._touched_dirs):
+        root = self._job_root
+        # 兜底：没有壳目录时（任务直接输出到 output_dir 根、多个任务共用同一目录），
+        # 退回只清理本次触及的目录，避免把其他任务/来源的 strm 一起删掉
+        if not root or os.path.abspath(root) == os.path.abspath(self.output_dir):
+            dirs = sorted(self._touched_dirs)
+        else:
+            dirs = [d for d, _sub, _files in os.walk(root)] or [root]
+        for d in dirs:
             try:
                 entries = os.listdir(d)
             except OSError as exc:
@@ -197,7 +218,7 @@ class StrmGenerator:
                 try:
                     os.remove(full)
                     self.deleted += 1
-                    self.log(f"删除孤儿 {fn}（源头已不存在）")
+                    self.log(f"删除孤儿 {fn}（云端源文件已不存在）")
                 except OSError as exc:
                     self.errors.append(f"删除失败 {fn}: {exc}")
 
