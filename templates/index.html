@@ -159,7 +159,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
       <div class="nav-item" data-page="settings">⚙️ 系统设置</div>
     </nav>
     <div class="sidebar-foot">
-      <div class="ver">v2.1 · 移动云盘直连</div>
+      <div class="ver">v2.1.2 · 移动云盘直连</div>
       <div class="exit-btn" onclick="alert('退出现在没有特殊作用，关闭浏览器即可。')">↩ 退出</div>
     </div>
   </aside>
@@ -257,7 +257,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
           <div class="page-title">存储浏览</div>
           <div class="page-sub">浏览云盘目录，把常用的目录一键建成任务</div>
         </div>
-        <button class="btn" id="btnNewTaskFromBrowse" style="display:none" onclick="newTaskFromBrowse()">+ 在此目录新建任务</button>
+        <button class="btn" id="btnNewTaskFromBrowse" style="display:none" onclick="onBrowseAction()">+ 在此目录新建任务</button>
       </div>
       <div class="card">
         <div class="browse-path" id="browsePath"></div>
@@ -452,6 +452,11 @@ document.querySelectorAll('#nav .nav-item').forEach(el=>{
     document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'))
     el.classList.add('active')
     $('page-'+el.dataset.page).classList.add('active')
+    // 从任务弹窗进来选目录、却点了别的导航：放弃选择，把弹窗放回来
+    if (pickingForTask && el.dataset.page!=='browse'){
+      pickingForTask = false
+      $('taskModal').classList.add('show')
+    }
     if (el.dataset.page==='browse'){ browseStack=[{id:'/',name:'根目录'}]; openBrowse('/') }
     if (el.dataset.page==='storage') loadConfig()
     if (el.dataset.page==='settings') { loadConfig(); loadCas() }
@@ -686,6 +691,8 @@ async function casPurge(){
 // 点子目录时把它的 file_id 压栈回传，点面包屑时截断栈跳回去。
 let browseStack = [{id:'/', name:'根目录'}]
 let browseItems = []
+// true = 是从任务弹窗点「浏览」进来的，选完目录要回填并回到弹窗
+let pickingForTask = false
 
 function browseDisplayPath(){
   return browseStack.map(s=>s.name).join(' / ')
@@ -714,6 +721,7 @@ async function openBrowse(folder){
   browseItems = j.items || []
   renderBrowsePath()
   $('btnNewTaskFromBrowse').style.display = folder==='/' ? 'none' : ''
+  $('btnNewTaskFromBrowse').textContent = pickingForTask ? '✅ 选择此目录' : '+ 在此目录新建任务'
   if (browseItems.length===0){
     $('browseList').innerHTML = '<div class="empty" style="padding:24px">此目录为空</div>'
     return
@@ -737,7 +745,9 @@ function gotoCrumb(i){
   openBrowse(browseStack[i].id)
 }
 function pickFile(i){
-  alert('任务要建在「目录」上，不能建在单个文件上。\n请回到它的父目录，再点「在此目录新建任务」。')
+  alert(pickingForTask
+    ? '任务要建在「目录」上，不能建在单个文件上。\n请回到它的父目录，再点右上角「✅ 选择此目录」。'
+    : '任务要建在「目录」上，不能建在单个文件上。\n请回到它的父目录，再点右上角「+ 在此目录新建任务」。')
 }
 function newTaskFromBrowse(){
   if (currentFolder==='/'){
@@ -745,6 +755,7 @@ function newTaskFromBrowse(){
     return
   }
   const name = browseStack[browseStack.length-1].name || 'new'
+  pickingForTask = false   // 从左侧导航进来是新建任务，不走"回填到已有弹窗"那条路
   openTaskModal()
   $('f_name').value = name
   $('f_folder').value = currentFolder
@@ -752,16 +763,50 @@ function newTaskFromBrowse(){
   $('f_folder_tip').textContent = '已选择：' + browseDisplayPath()
 }
 function openFolderPicker(){
-  $('page-browse').classList.add('active')
+  // 从任务弹窗进来选目录：必须先把弹窗收起来。
+  // 弹窗是 position:fixed + z-index:50 的全屏层，不收起来会盖住浏览页，看着像"点了没反应"
+  pickingForTask = true
+  $('taskModal').classList.remove('show')
+  // 切到浏览页
   document.querySelectorAll('.page').forEach(x=>{ if(x.id!=='page-browse') x.classList.remove('active') })
   document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'))
+  $('page-browse').classList.add('active')
   document.querySelector('[data-page=browse]').classList.add('active')
-  // 模态里还没选过目录时，从根目录重新开始选
-  if (!$('f_folder').value || $('f_folder').value === '/'){
-    browseStack = [{id:'/', name:'根目录'}]
-    currentFolder = '/'
+  // 起点：新建任务从根目录开始；编辑老任务时从它当前目录开始，方便就近换目录。
+  // 想彻底重选，点面包屑最左边的「根目录」即可回到顶层（不这么处理的话，
+  // currentFolder 是全局的，会从别的任务上次浏览的位置接着走，容易选错目录）
+  const start = ($('f_folder').value && $('f_folder').value !== '/') ? $('f_folder').value : '/'
+  browseStack = (start === '/')
+    ? [{id:'/', name:'根目录'}]
+    : [{id:'/', name:'根目录'}, {id:start, name:'当前目录'}]
+  currentFolder = start
+  openBrowse(start)
+}
+// 浏览页右上角那个按钮：从弹窗进来是「选择此目录」，从左侧导航进来是「新建任务」
+function onBrowseAction(){
+  if (pickingForTask) pickFolderForTask()
+  else newTaskFromBrowse()
+}
+function pickFolderForTask(){
+  if (currentFolder==='/'){
+    alert('请先进到一个子目录，再选它。')
+    return
   }
-  openBrowse(currentFolder)
+  // 回填目录。不清空弹窗里其它已填内容，也不动 editingId，所以编辑老任务时同样安全
+  $('f_folder').value = currentFolder
+  $('f_folder_path').value = browseDisplayPath()
+  $('f_folder_tip').textContent = '已选择：' + browseDisplayPath()
+  // 任务名还空着的话，顺手用目录名补上
+  if (!$('f_name').value.trim()){
+    $('f_name').value = browseStack[browseStack.length-1].name || ''
+  }
+  pickingForTask = false
+  // 切回任务管理页，并把弹窗放回来
+  document.querySelectorAll('.page').forEach(x=>{ if(x.id!=='page-tasks') x.classList.remove('active') })
+  document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'))
+  $('page-tasks').classList.add('active')
+  document.querySelector('[data-page=tasks]').classList.add('active')
+  $('taskModal').classList.add('show')
 }
 
 // ============ 启动 ============
