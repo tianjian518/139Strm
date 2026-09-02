@@ -212,25 +212,42 @@ class CASRestorer:
     # 临时目录
     # ------------------------------------------------------------------
 
-    def find_temp_dir(self):
-        """在根目录里查找已存在的临时文件夹，找不到返回 None。"""
-        try:
-            for item in self.client.personal_list(self.client.root_folder_id):
-                if item.name == self.temp_dir_name and item.is_folder:
-                    return item.file_id
-        except Exception as exc:
-            logger.warning("列出根目录失败: %s", exc)
+    def _scan_temp_dir(self):
+        """在根目录里查找临时文件夹；查询失败会抛异常（区别于「确实没有」）。"""
+        for item in self.client.personal_list(self.client.root_folder_id):
+            if item.name == self.temp_dir_name and item.is_folder:
+                return item.file_id
         return None
 
-    def ensure_temp_dir(self):
-        """取得（必要时创建）根目录里的临时文件夹。"""
-        with self._lock:
-            if self._temp_dir_id:
-                return self._temp_dir_id
+    def find_temp_dir(self):
+        """在根目录里查找已存在的临时文件夹，找不到或查询失败都返回 None。"""
+        try:
+            return self._scan_temp_dir()
+        except Exception as exc:
+            logger.warning("列出根目录失败: %s", exc)
+            return None
 
-            # 优先使用调用方记住的目录 ID（跨重启也不重复创建）
-            found = self.find_temp_dir()
+    def ensure_temp_dir(self):
+        """取得（必要时创建）根目录里的临时文件夹。
+
+        每次都会重新确认目录 ID：临时目录可能被用户在云盘里删掉，
+        或从回收站恢复后 ID 变了。复用一个失效的 ID 会导致所有 CAS
+        播放全部失败，所以必须拿到当前真实存在的目录 ID。
+        """
+        with self._lock:
+            try:
+                found = self._scan_temp_dir()
+            except Exception as exc:
+                # 只是查不到（网络抖动等），手上有记住的 ID 就先沿用，避免误建新目录
+                if self._temp_dir_id:
+                    logger.warning("列出根目录失败，沿用已记住的临时目录: %s", exc)
+                    return self._temp_dir_id
+                raise CASError(f"无法列出云盘根目录: {exc}")
+
             if found:
+                if self._temp_dir_id and found != self._temp_dir_id:
+                    logger.warning("临时目录 ID 已变化 %s -> %s，已自动更新",
+                                   self._temp_dir_id, found)
                 self._temp_dir_id = found
                 return found
 
