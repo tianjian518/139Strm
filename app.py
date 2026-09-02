@@ -990,6 +990,57 @@ def api_cas_purge():
 #  兼容旧版 Web UI 的 410 Gone 提示，避免旧前端误调。）
 
 
+def _dir_is_mount(path):
+    """判断目录是否是独立挂载点（挂了卷才会是）。读不到 /proc/mounts 返回 None（未知）。"""
+    if not path:
+        return None
+    try:
+        target = os.path.realpath(path)
+    except OSError:
+        return None
+    try:
+        with open("/proc/mounts", encoding="utf-8") as fp:
+            for line in fp:
+                cols = line.split()
+                if len(cols) >= 2:
+                    try:
+                        if os.path.realpath(cols[1]) == target:
+                            return True
+                    except OSError:
+                        continue
+    except OSError:
+        return None
+    return False
+
+
+@app.route("/api/storage")
+def api_storage():
+    """数据落在哪、有没有挂载卷。
+
+    没挂载卷时，配置 / 任务 / strm 全写在容器自己的可写层里，
+    容器一删除重建（比如升级镜像）就全没了，所以这里给出显式提示。
+    """
+    cfg = load_config()
+    cfg_dir = os.path.dirname(CONFIG_PATH) or "."
+    out_dir = cfg.get("output_dir") or ""
+    cfg_mounted = _dir_is_mount(cfg_dir)
+    out_mounted = _dir_is_mount(out_dir)
+    # 配置目录必须确认挂了；输出目录没配置时按"不扣分"处理
+    persisted = bool(cfg_mounted) and (out_mounted is not False)
+    return jsonify({
+        "ok": True,
+        "config_dir": cfg_dir,
+        "config_path": CONFIG_PATH,
+        "tasks_path": get_tasks_path(),
+        "output_dir": out_dir,
+        "config_mounted": cfg_mounted,     # True / False / None(未知)
+        "output_mounted": out_mounted,
+        "persisted": persisted,
+        "config_exists": os.path.exists(CONFIG_PATH),
+        "tasks_exists": os.path.exists(get_tasks_path()),
+    })
+
+
 @app.route("/api/schedule", methods=["GET", "POST"])
 def api_schedule_removed():
     return jsonify({

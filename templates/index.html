@@ -159,7 +159,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
       <div class="nav-item" data-page="settings">⚙️ 系统设置</div>
     </nav>
     <div class="sidebar-foot">
-      <div class="ver">v2.1.5 · 移动云盘直连</div>
+      <div class="ver">v2.1.6 · 移动云盘直连</div>
       <div class="exit-btn" onclick="alert('退出现在没有特殊作用，关闭浏览器即可。')">↩ 退出</div>
     </div>
   </aside>
@@ -288,6 +288,17 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
         <div>
           <div class="page-title">系统设置</div>
           <div class="page-sub">STRM 默认参数：任务没填就使用这里的值</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">💾 数据存储 <span class="sub" id="storagePill"></span></div>
+        <div id="storageWarn" style="display:none;padding:10px 12px;border-radius:8px;background:#fef2f2;color:#b91c1c;font-size:13px;line-height:1.7;margin-bottom:10px"></div>
+        <div class="hint">下面这些目录必须挂载到 NAS 上的真实文件夹。没挂载的话，配置、任务、生成的 STRM 都只写在容器内部，容器一删除重建（比如升级版本）就全没了。</div>
+        <div style="margin-top:10px;font-size:13px;line-height:2">
+          <div>配置 &amp; 凭据：<span class="mono" id="stConfigPath">-</span> <span id="stConfigFlag"></span></div>
+          <div>任务列表：<span class="mono" id="stTasksPath">-</span> <span id="stTasksFlag"></span></div>
+          <div>STRM 输出：<span class="mono" id="stOutPath">-</span> <span id="stOutFlag"></span></div>
         </div>
       </div>
 
@@ -641,6 +652,38 @@ async function loadConfig(){
   $('casEnabled').checked = !!j.cas_enabled
   $('casTtl').value = j.cas_temp_ttl || 300
   $('casAllowAll').checked = !!j.cas_allow_all_ext
+  loadStorage()
+}
+async function loadStorage(){
+  let j
+  try { j = await fetch('/api/storage').then(r=>r.json()) } catch(e){ return }
+  if (!j.ok) return
+  const flag = v => v===true ? '<span style="color:#16a34a">✅ 已挂载</span>'
+                  : v===false ? '<span style="color:#dc2626">❌ 未挂载</span>'
+                  : '<span style="color:#94a3b8">未知</span>'
+  $('stConfigPath').textContent = j.config_path || '-'
+  $('stTasksPath').textContent  = j.tasks_path || '-'
+  $('stOutPath').textContent    = j.output_dir || '(未设置)'
+  $('stConfigFlag').innerHTML   = flag(j.config_mounted)
+  $('stOutFlag').innerHTML      = flag(j.output_mounted)
+  $('stTasksFlag').innerHTML    = j.tasks_exists
+      ? '<span style="color:#64748b">已保存</span>'
+      : '<span style="color:#94a3b8">尚未创建</span>'
+  const warn = $('storageWarn')
+  if (j.config_mounted === false || j.output_mounted === false){
+    warn.style.display = ''
+    warn.innerHTML = '⚠️ <b>数据没有挂载到 NAS 的文件夹！</b><br>' +
+      '现在配置、任务、生成的 STRM 都只写在容器内部，' +
+      '<b>容器一旦删除重建（比如升级版本）就会全部消失</b>。<br>' +
+      '请在 Docker 部署里把上面两个路径挂到 NAS 的真实文件夹，' +
+      '具体做法见项目 README 的「数据存储与挂载」一节。'
+    $('storagePill').textContent = '⚠️ 未持久化'
+    $('storagePill').style.color = '#dc2626'
+  } else {
+    warn.style.display = 'none'
+    $('storagePill').textContent = j.persisted ? '✅ 已持久化' : '检查中'
+    $('storagePill').style.color = j.persisted ? '#16a34a' : '#94a3b8'
+  }
 }
 async function saveConfig(){
   const body = {

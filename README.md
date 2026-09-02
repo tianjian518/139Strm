@@ -81,6 +81,22 @@ Content-Range:  bytes 0-1023/4554461676
 
 ## 快速开始
 
+> ### ⚠️ 先读这一条：数据会不会丢，全看"挂载"
+>
+> 139Strm 有三样数据，都必须落到**你 NAS 上的真实文件夹**，不能留在容器里：
+>
+> | 数据 | 容器里的路径 | 挂到 NAS 的哪里（举例） |
+> | --- | --- | --- |
+> | 配置 + 云盘凭据 | `/app/config` | `/docker/139strm/config` |
+> | 任务列表（和配置文件同目录，自动跟着） | `/app/config/tasks.json` | 同上 |
+> | 生成的 STRM | `/strm` | `/docker/139strm/strm` |
+>
+> **不挂载 = 数据只写在容器内部，容器一删除重建（升级版本就是重建）就全部清空。**
+> 挂载之后，无论重启、重建还是升级版本，配置和 STRM 都还在。
+>
+> 拿不准自己挂没挂：打开 139Strm → **系统设置** → 最上面「💾 数据存储」，
+> 会直接显示每个目录是「✅ 已挂载」还是「❌ 未挂载」。
+
 ### 方式一：Docker（推荐，支持 AMD64 / ARM64）
 
 ```bash
@@ -89,7 +105,7 @@ mkdir -p 139strm/{config,strm} && cd 139strm
 cat > docker-compose.yml <<'EOF'
 services:
   139strm:
-    image: tianjian518/139strm:2.1
+    image: tianjian518/139strm:2.1.6
     container_name: 139strm
     restart: unless-stopped
     ports:
@@ -121,6 +137,28 @@ docker run -d --name 139strm --restart unless-stopped \
   -v ./strm:/strm \
   139strm
 ```
+
+### 数据存储与挂载（飞牛 OS / 群晖 等图形界面）
+
+在飞牛里建容器，最关键的是填「存储空间」那一步：
+
+| 容器内路径 | NAS 上的文件夹 | 装的是什么 |
+| --- | --- | --- |
+| `/app/config` | `/docker/139strm/config` | 配置 + 云盘凭据 + 任务列表 |
+| `/strm` | `/docker/139strm/strm` | 生成的 STRM（Emby / 飞牛影视也挂这个） |
+
+步骤：
+
+1. 先在 NAS 上把这两个文件夹建好（文件管理里新建 `docker/139strm/config` 和 `docker/139strm/strm`）
+2. 新建（或编辑）容器 → 找到「存储空间」/「卷 Volume」那一项
+3. 点「添加」：左边选 NAS 文件夹 `docker/139strm/config`，右边容器路径填 `/app/config`
+4. 再加一条：`docker/139strm/strm` → `/strm`
+5. 端口映射填 `8025:8025`
+6. 启动后，进「系统设置 → 💾 数据存储」确认两项都显示「✅ 已挂载」
+
+> **已经丢过一次怎么补救**：如果旧容器**还没删**（只是停止状态），
+> 可以在飞牛的终端里执行 `docker cp 旧容器名:/app/config ./config` 把配置和任务拷回来；
+> 容器一旦被删除，里面的数据就真的找不回来了。
 
 > **关键点**：`./strm` 这个目录必须同时挂载给 Emby / Jellyfin，两边路径保持一致。
 
