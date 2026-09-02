@@ -817,14 +817,17 @@ def _is_valid_cron(expr):
     parts = expr.strip().split()
     if len(parts) != 5:
         return False
-    for i, (lo, hi) in enumerate([(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]):
+    for i, (lo, hi) in enumerate([(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)]):
         if not _expand_cron_field(parts[i], lo, hi):
             return False
     return True
 
 
-def _next_run_from_cron(expr, now):
-    """返回 expr 在 now 之后最近一次触发的 datetime；表达式空/无效返回 None。"""
+def _parse_cron(expr):
+    """解析 5 段 crontab，返回各字段允许值集合；表达式空/无效返回 None。
+
+    星期按标准 crontab 语义：0 和 7 都表示周日。
+    """
     if not expr:
         return None
     try:
@@ -835,17 +838,69 @@ def _next_run_from_cron(expr, now):
         hours = _expand_cron_field(parts[1], 0, 23)
         doms = _expand_cron_field(parts[2], 1, 31)
         months = _expand_cron_field(parts[3], 1, 12)
-        dows = _expand_cron_field(parts[4], 0, 6)
+        dows = _expand_cron_field(parts[4], 0, 7)
     except Exception:
         return None
     if not (mins and hours and doms and months and dows):
         return None
+    if 7 in dows:
+        dows.discard(7)
+        dows.add(0)
+    return mins, hours, doms, months, dows
+
+
+def _cron_dow(dt):
+    """换算成标准 crontab 的星期值：0=周日, 1=周一 … 6=周六。"""
+    return dt.isoweekday() % 7
+
+
+def _cron_day_match(doms, dows, dt):
+    """判断某天是否满足「日 / 星期」两个字段（标准 crontab 语义）。
+
+    - 两个字段都是 *（未限制）→ 每天都算；
+    - 只有「日」被限定 → 以「日」为准；
+    - 只有「星期」被限定 → 以「星期」为准（否则写「周一」会变成每天都跑）；
+    - 两个都被限定 → OR，任一满足即跑。
+    """
+    dom_restricted = len(doms) < 31
+    dow_restricted = len(dows) < 7
+    if dom_restricted and dow_restricted:
+        return (dt.day in doms) or (_cron_dow(dt) in dows)
+    if dom_restricted:
+        return dt.day in doms
+    if dow_restricted:
+        return _cron_dow(dt) in dows
+    return True
+
+
+def _cron_matches(expr, dt):
+    """dt（精确到分钟）是否命中 cron 表达式——调度器靠它判断「到点没」。"""
+    parsed = _parse_cron(expr)
+    if not parsed:
+        return False
+    mins, hours, doms, months, dows = parsed
+    # 月份/星期/日 都要满足，日期部分按标准 crontab 语义交给 _cron_day_match
+    return (dt.month in months
+            and _cron_day_match(doms, dows, dt)
+            and dt.hour in hours
+            and dt.minute in mins)
+
+
+def _next_run_from_cron(expr, now):
+    """返回 expr 在 now 之后最近一次触发的 datetime；表达式空/无效返回 None。
+
+    注意：返回的一定是「now 之后」的点，永远大于 now，
+    不能拿它跟 now 比大小来判断是否到点（那会导致任务永不触发）。
+    """
+    parsed = _parse_cron(expr)
+    if not parsed:
+        return None
+    mins, hours, doms, months, dows = parsed
     from datetime import timedelta
-    # 标准 crontab：dom 和 dow 是 OR 关系（任一满足即可），其它都是 AND
     cand = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
     for _ in range(60 * 24 * 366):  # 最多往后扫一年
         if (cand.month in months
-                and (cand.day in doms or cand.weekday() in dows)  # weekday(): 周一=0
+                and _cron_day_match(doms, dows, cand)
                 and cand.hour in hours
                 and cand.minute in mins):
             return cand
@@ -868,6 +923,10 @@ def _task_scheduler_loop():
             cfg = load_config()
             tasks = load_tasks()
             now = datetime.now()
+            # 关键：拿「当前这一分钟」去匹配 cron，而不是比较 _next_run_from_cron()。
+            # 后者返回的是 now「之后」的下一个触发点，永远大于 now，
+            # 于是 now >= nxt 永远不成立 —— 表现为界面显示着下次时间、却到点不运行。
+            tick = now.replace(second=0, microsecond=0)
             due = []
             for t in tasks:
                 if not t.get("enabled", True):
@@ -875,16 +934,12 @@ def _task_scheduler_loop():
                 cron = (t.get("cron") or "").strip()
                 if not cron:
                     continue
-                nxt = _next_run_from_cron(cron, now)
-                if not nxt:
+                # 30 秒一个 tick，同一分钟会扫到两次，用这一分钟做去重键
+                if _last_trigger_key.get(t["id"]) == tick:
                     continue
-                # 是否到点：上次触发时间在 nxt 之前、现在已 >= nxt
-                last = _last_trigger_key.get(t["id"])
-                if last and nxt <= last:
-                    continue
-                if now >= nxt:
+                if _cron_matches(cron, tick):
                     due.append(t)
-                    _last_trigger_key[t["id"]] = nxt
+                    _last_trigger_key[t["id"]] = tick
             if not due:
                 continue
             # 串行入队（受 _claim_running 约束）
