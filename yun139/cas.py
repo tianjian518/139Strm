@@ -49,6 +49,10 @@ TEMP_DIR_NAME = "139STRM_TEMP"
 # 不能立刻删：播放器拿到 302 之后才会真正发起带 Range 的请求
 DEFAULT_TEMP_TTL = 300
 
+# 一个已还原的临时文件最多被复用多久（秒）。
+# 超过这个时长后下次播放强制重新秒传还原，避免长时间复用同一份临时文件。
+MAX_SESSION_TTL = 12 * 3600
+
 VIDEO_EXTS = (
     ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".ts", ".m2ts",
     ".wmv", ".rmvb", ".m4v", ".mpg", ".mpeg", ".3gp",
@@ -199,6 +203,16 @@ class CASRestorer:
         # 临时文件到期时间表：用独立锁保护，避免和 _lock 互相等待
         self._pending_lock = threading.Lock()
         self._reaper = None
+        # 已还原会话：cas 文件 ID -> {"temp_id","name","size","created_at"}
+        # 播放中反复请求直链时，只复用这里的临时文件重新取一次直链，
+        # 绝不重新秒传还原 —— 否则一部电影会被反复还原出几十 GB。
+        self._sessions = {}
+        # 每个 cas 文件的还原单飞锁，避免并发请求各还原一份
+        self._flight = {}
+        self._state_lock = threading.Lock()
+        # 删除失败的临时文件重试次数
+        self._delete_failures = {}
+        self.max_session_ttl = MAX_SESSION_TTL
 
     # ------------------------------------------------------------------
     # 解析
@@ -337,7 +351,7 @@ class CASRestorer:
         """
         把 .cas 还原成临时目录里的一个真文件。
 
-        返回 (直链, 原始大小, 临时文件ID, 还原文件名)
+        返回 (直链, 原始大小, 临时文件ID, 云端实际文件名, 原始片名)
         """
         info = self.parse(cas_file_id, cas_name)
         preview_name = resolve_restore_name(cas_name, info)
@@ -364,25 +378,171 @@ class CASRestorer:
         if not link:
             self.delete_quietly(temp_id)
             raise CASError("还原成功但未能取得直链")
-        return link, info.size, temp_id, real_name
+        # real_name 是云端实际文件名（带 TEMP_ 前缀，可能被服务端改号），
+        # preview_name 是原始片名，清扫旧副本时按它来认人
+        return link, info.size, temp_id, real_name, preview_name
+
+    # ------------------------------------------------------------------
+    # 取直链（复用优先）
+    # ------------------------------------------------------------------
+
+    def _flight_lock(self, cas_file_id):
+        """取得某个 .cas 的还原单飞锁。"""
+        with self._state_lock:
+            lock = self._flight.get(cas_file_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._flight[cas_file_id] = lock
+            return lock
+
+    def _refresh_link(self, temp_id):
+        """对已存在的临时文件重新取一条直链；文件没了返回空串。"""
+        try:
+            return self.client.personal_get_link(temp_id) or ""
+        except Exception as exc:
+            logger.info("复用临时文件 %s 取直链失败，将重新还原: %s", temp_id, exc)
+            return ""
+
+    def _session_valid(self, cas_file_id):
+        """有没有还能用的已还原会话。"""
+        with self._state_lock:
+            sess = self._sessions.get(cas_file_id)
+        if not sess:
+            return None
+        if time.time() - sess["created_at"] > self.max_session_ttl:
+            with self._state_lock:
+                self._sessions.pop(cas_file_id, None)
+            return None
+        return sess
+
+    def _drop_session(self, cas_file_id):
+        with self._state_lock:
+            return self._sessions.pop(cas_file_id, None)
+
+    def _active_temp_ids(self):
+        """所有正在被复用（不该被清扫）的临时文件 ID。"""
+        with self._state_lock:
+            return {s["temp_id"] for s in self._sessions.values()}
+
+    def _purge_leftovers(self, restore_name):
+        """
+        清掉这部片子残留在临时目录里的其它副本。
+
+        服务重启、进程被杀、上一次删除失败都会留下残骸；
+        不清理的话，每播一次就多一份，几部片子就能堆出几十 GB。
+        正在使用的会话（_sessions 里登记着的）一律跳过。
+        """
+        if not restore_name:
+            return 0
+        try:
+            temp_dir = self.ensure_temp_dir()
+            items = self.client.personal_list(temp_dir)
+        except Exception as exc:
+            logger.warning("清扫临时目录失败（忽略）: %s", exc)
+            return 0
+        keep = self._active_temp_ids()
+        removed = 0
+        for item in items:
+            if item.is_folder or item.file_id in keep:
+                continue
+            # 临时文件名形如 TEMP_<毫秒>_<随机>_<片名>，按片名认人
+            if not (item.name == restore_name
+                    or item.name.endswith("_" + restore_name)):
+                continue
+            self.cancel_delete(item.file_id)
+            if self.delete_quietly(item.file_id):
+                removed += 1
+        if removed:
+            logger.info("清扫临时目录：删除 %d 个 %s 的旧副本", removed, restore_name)
+        return removed
+
+    def fetch_link(self, cas_file_id, cas_name):
+        """
+        取得 .cas 的播放直链：**能复用就复用**。
+
+        返回 (直链, 大小, 临时文件ID, 还原文件名, 是否重新秒传)。
+
+        播放过程中播放器会反复来换直链，如果每次都重新秒传还原，
+        临时目录里就会同时躺着好几份完整电影（旧的要等 TTL 才删），
+        一部片子就能堆出几十 GB。这里改成：
+          1. 已有还原好的临时文件 → 换一条新直链即可，零新增文件；
+          2. 临时文件确实没了 → 才重新秒传，且先清掉这部片子的旧副本。
+        """
+        sess = self._session_valid(cas_file_id)
+        if sess:
+            link = self._refresh_link(sess["temp_id"])
+            if link:
+                return link, sess["size"], sess["temp_id"], sess["name"], False
+            self._drop_session(cas_file_id)
+
+        # 单飞：并发请求只让第一个去还原，其余的等它出结果后直接复用
+        with self._flight_lock(cas_file_id):
+            sess = self._session_valid(cas_file_id)
+            if sess:
+                link = self._refresh_link(sess["temp_id"])
+                if link:
+                    return link, sess["size"], sess["temp_id"], sess["name"], False
+                self._drop_session(cas_file_id)
+
+            link, size, temp_id, real_name, base_name = self.restore_temp(
+                cas_file_id, cas_name
+            )
+            # 先登记会话再清扫：这样新文件会被列入保护名单，不会被自己清掉
+            with self._state_lock:
+                self._sessions[cas_file_id] = {
+                    "temp_id": temp_id,
+                    "name": real_name,
+                    "base_name": base_name,
+                    "size": size,
+                    "created_at": time.time(),
+                }
+            self._purge_leftovers(base_name)
+            logger.info("已秒传还原 %s -> %s（临时文件 %s）",
+                        cas_name, real_name, temp_id)
+            return link, size, temp_id, real_name, True
+
+    def session_count(self):
+        """当前保持着的还原会话数量。"""
+        with self._state_lock:
+            return len(self._sessions)
 
     # ------------------------------------------------------------------
     # 清理
     # ------------------------------------------------------------------
 
     def delete_quietly(self, file_id):
-        """先移入回收站、再彻底删除，失败只记日志不抛错。"""
+        """先移入回收站、再彻底删除，失败只记日志不抛错。
+
+        只要文件离开了临时目录就算成功（进了回收站也不再堆在临时目录里）。
+        """
+        trashed = False
         try:
             self.client.personal_trash([file_id])
+            trashed = True
         except Exception as exc:
             logger.warning("移入回收站失败 %s: %s", file_id, exc)
         try:
             self.client.personal_delete([file_id])
             logger.info("已清理临时文件 %s", file_id)
+            with self._state_lock:
+                self._delete_failures.pop(file_id, None)
             return True
         except Exception as exc:
+            if trashed:
+                logger.info("临时文件 %s 已进回收站，彻底删除失败（可忽略）: %s",
+                            file_id, exc)
+                with self._state_lock:
+                    self._delete_failures.pop(file_id, None)
+                return True
             logger.warning("彻底删除失败 %s: %s", file_id, exc)
             return False
+
+    def cancel_delete(self, file_id):
+        """把文件从待删表里摘掉（准备手动删除 / 会话重建时用）。"""
+        with self._pending_lock:
+            self._pending.pop(file_id, None)
+        with self._state_lock:
+            self._delete_failures.pop(file_id, None)
 
     def schedule_delete(self, file_id, delay=None):
         """登记临时文件的延迟删除时间（到点由后台清理线程删掉）。
@@ -407,7 +567,11 @@ class CASRestorer:
             self._reaper.start()
 
     def _reap_loop(self):
-        """每 10 秒检查一次，删掉到期的临时文件。"""
+        """每 10 秒检查一次，删掉到期的临时文件。
+
+        删除失败的文件会退避重试（最多 6 次）。以前失败一次就永久遗忘，
+        接口抖一下就会在云盘里留下一份永远清不掉的大文件。
+        """
         while True:
             try:
                 time.sleep(10)
@@ -418,7 +582,18 @@ class CASRestorer:
                     for fid in due:
                         self._pending.pop(fid, None)
                 for fid in due:
-                    self.delete_quietly(fid)
+                    if self.delete_quietly(fid):
+                        continue
+                    with self._state_lock:
+                        tries = self._delete_failures.get(fid, 0) + 1
+                        if tries > 6:
+                            self._delete_failures.pop(fid, None)
+                            logger.error("临时文件 %s 连续 %d 次删除失败，放弃",
+                                         fid, tries)
+                            continue
+                        self._delete_failures[fid] = tries
+                    with self._pending_lock:
+                        self._pending[fid] = now + 60 * tries
             except Exception as exc:
                 logger.warning("临时文件清理线程异常: %s", exc)
 

@@ -454,6 +454,7 @@ function show(el, kind, msg){
   setTimeout(()=>{m.className='msg'}, 6000)
 }
 function fmtDate(s){ if(!s) return '—'; const d=new Date(s); return d.toLocaleString('zh-CN',{hour12:false}) }
+function fmtBytes(n){ if(n==null) return '—'; const u=['B','KB','MB','GB','TB']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++} return n.toFixed(n<10&&i>0?1:0)+' '+u[i] }
 function esc(s){ return String(s||'').replace(/[<>&"']/g, c=>({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'})[c]) }
 
 // ============ 导航 ============
@@ -720,7 +721,15 @@ async function testConn(){
 
 async function loadCas(){
   const j = await fetch('/api/cas/status').then(r=>r.json())
-  $('casPill').textContent = j.enabled ? `已启用 · 待清理 ${j.pending_cleanup||0}` : '未启用'
+  let txt = j.enabled ? '已启用' : '未启用'
+  if (j.enabled) {
+    const bits = []
+    if (j.temp_bytes != null) bits.push(`临时目录 ${fmtBytes(j.temp_bytes)}`)
+    if (j.active_sessions) bits.push(`播放中 ${j.active_sessions}`)
+    if (j.pending_cleanup) bits.push(`待清理 ${j.pending_cleanup}`)
+    txt += bits.length ? ' · ' + bits.join(' · ') : ''
+  }
+  $('casPill').textContent = txt
 }
 async function casPurge(){
   if (!confirm('立即清空残留临时文件？')) return

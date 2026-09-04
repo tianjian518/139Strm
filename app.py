@@ -35,11 +35,12 @@ _link_cache = {}
 _cache_lock = threading.Lock()
 LINK_TTL = 2 * 3600  # 直链有时效，缓存 2 小时
 
-# CAS 直链指向的是「秒传还原出来的临时文件」，而临时文件默认 5 分钟后就删了。
-# 所以 CAS 直链只能短缓存，仅用于吸收同一次播放里的重试/并发请求；
-# 缓存久了就会拿到指向已删文件的旧地址 —— 表现就是「播过的再播一直加载」。
-# 超过这个时间再播放，一律重新秒传还原，等价于一出新片，拿到的必然是新鲜地址。
-CAS_LINK_TTL = 60
+# CAS 直链指向的是「秒传还原出来的临时文件」，缓存不能比直链自己的寿命还长。
+# 这里只设上限与兜底，真正的缓存时长取直链 t= 参数（见 _link_expire）；
+# 缓存失效时优先复用已还原的临时文件重新取链，只有文件没了才重新秒传。
+CAS_LINK_MAX_TTL = 15 * 60
+# 直链缓存失效后，临时文件再多留一会儿（防止最后一波 Range 请求打空）
+CAS_TEMP_GRACE = 120
 
 # 后台生成任务（队列式：可串行执行多个任务）
 _task_state = {
@@ -726,58 +727,43 @@ def _get_link(client, file_id):
     return url
 
 
-def _cas_link_alive(url):
-    """缓存里的直链还能不能用（临时文件可能已被删、或签名过期）。
-
-    返回 True / False；网络异常时不敢断定，返回 None。
-    """
-    try:
-        import requests
-        resp = requests.head(url, timeout=8, allow_redirects=True)
-        return resp.status_code < 400
-    except Exception:
-        return None
-
-
 def _get_cas_link(client, cfg, file_id, cas_name):
     """
-    .cas 文件的播放直链：先秒传还原出临时文件，取直链后延迟删除临时文件。
+    .cas 文件的播放直链：秒传还原出临时文件，再把临时文件的直链 302 给播放器。
 
-    这个直链指向的是「还原出来的临时文件」，文件一删链接就废。
-    所以这里只做很短的缓存（吸收同一次播放里的重试/并发请求）；
-    超过缓存时间再播放，就重新秒传还原 —— 等价于一出新片，地址一定是新鲜的。
-    停止播放后不再有请求，临时文件到点自动清掉，不残留。
+    这里最容易踩的坑是「反复还原」：播放过程中播放器会不断回来换直链，
+    如果每次换链都重新秒传还原一个新文件，而旧文件要等 TTL 到点才删，
+    同一部电影就会在临时目录里同时躺着好几份 —— 一部 4K 片子几十分钟就能
+    堆出几十 GB。所以规则是：
+
+      * 缓存期内：直接复用上一条直链，只给临时文件续期；
+      * 缓存过期：优先复用**已还原的那一个**临时文件，重新取一条直链
+        （不产生新文件）；只有临时文件确实没了才重新秒传还原，
+        而且还原前会先清掉这部片子的旧副本；
+      * 临时文件的删除时间跟着缓存走（缓存失效后再留 CAS_TEMP_GRACE 秒），
+        既不会中途被删导致播放中断，也不会长期滞留。
     """
     now = time.time()
     key = "cas:" + file_id
     restorer = get_restorer(cfg, client)
-    # 缓存必须远短于临时文件存活时间，这里取两者更小值并留足余量
-    cas_ttl = max(15, min(CAS_LINK_TTL, int(restorer.temp_ttl) // 2))
 
     with _cache_lock:
         cached = _link_cache.get(key)
     if cached and len(cached) >= 3 and cached[1] > now:
-        url, _expire, temp_id = cached[0], cached[1], cached[2]
-        if _cas_link_alive(url) is not False:
-            # 还在用 → 续期，避免连续播放播到一半被清掉
-            restorer.schedule_delete(temp_id)
-            with _cache_lock:
-                _link_cache[key] = (url, min(now + cas_ttl,
-                                             _link_expire(url, LINK_TTL)), temp_id)
-            return url
-        # 已失效（临时文件被清 / 签名过期）→ 丢掉缓存，下面重新还原
-        with _cache_lock:
-            _link_cache.pop(key, None)
-        app.logger.info("缓存的 CAS 直链已失效，重新还原：%s", cas_name)
+        url, expire, temp_id = cached[0], cached[1], cached[2]
+        # 还在有效期内 → 直接复用，并把临时文件的寿命续到缓存失效之后
+        restorer.schedule_delete(temp_id, delay=max(60, expire - now + CAS_TEMP_GRACE))
+        return url
 
-    url, size, temp_id, real_name = restorer.restore_temp(file_id, cas_name)
-    # 延迟删除：给播放器留出开始缓冲的时间；播放中再次请求会自动续期
-    restorer.schedule_delete(temp_id)
-    remember_temp_dir(cfg, restorer.get_temp_dir())
-
+    url, size, temp_id, real_name, restored = restorer.fetch_link(file_id, cas_name)
+    expire = min(_link_expire(url, LINK_TTL), now + CAS_LINK_MAX_TTL)
+    # 临时文件必须活过缓存：缓存失效后再宽限 CAS_TEMP_GRACE 秒
+    restorer.schedule_delete(temp_id, delay=max(60, expire - now + CAS_TEMP_GRACE))
+    if restored:
+        remember_temp_dir(cfg, restorer.get_temp_dir())
+        app.logger.info("CAS 还原成功 %s -> %s (%d 字节)", cas_name, real_name, size)
     with _cache_lock:
-        _link_cache[key] = (url, now + cas_ttl, temp_id)
-    app.logger.info("CAS 还原成功 %s -> %s (%d 字节)", cas_name, real_name, size)
+        _link_cache[key] = (url, expire, temp_id)
     return url
 
 
@@ -1012,13 +998,28 @@ def api_cas_status():
     """查看当前待清理的临时文件数量与配置。"""
     cfg = load_config()
     pending = sum(r.pending_count() for r in _restorers.values())
-    return jsonify({
+    sessions = sum(r.session_count() for r in _restorers.values())
+    result = {
         "ok": True,
         "enabled": bool(cfg.get("cas_enabled", True)),
         "temp_ttl": cfg.get("cas_temp_ttl", 300),
         "allow_all_ext": bool(cfg.get("cas_allow_all_ext", False)),
         "pending_cleanup": pending,
-    })
+        "active_sessions": sessions,
+    }
+    # 顺便看一眼临时目录里到底堆了多少东西（查不到就算了，不影响主流程）
+    if cfg.get("authorization"):
+        try:
+            client = build_client(cfg)
+            client.init()
+            restorer = get_restorer(cfg, client)
+            temp_dir = restorer.ensure_temp_dir()
+            items = client.personal_list(temp_dir)
+            result["temp_files"] = len(items)
+            result["temp_bytes"] = sum(i.size for i in items)
+        except Exception as exc:
+            result["temp_dir_error"] = str(exc)
+    return jsonify(result)
 
 
 @app.route("/api/cas/purge", methods=["POST"])
