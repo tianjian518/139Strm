@@ -41,6 +41,11 @@ LINK_TTL = 2 * 3600  # 直链有时效，缓存 2 小时
 CAS_LINK_MAX_TTL = 15 * 60
 # 直链缓存失效后，临时文件再多留一会儿（防止最后一波 Range 请求打空）
 CAS_TEMP_GRACE = 120
+# 缓存期内多久探一次直链是否还活着（秒）。设这个是为了接住「用户手动清空了
+# 临时目录」这类情况：不探的话缓存没到期，播放器会一直拿到指向已删文件的死链。
+# 节流 + 只有明确 4xx 才判失效，所以不会因为 CDN 不支持探测而反复还原。
+CAS_PROBE_INTERVAL = 60
+_probe_at = {}
 
 # 后台生成任务（队列式：可串行执行多个任务）
 _task_state = {
@@ -697,22 +702,71 @@ def api_strm_status():
 # 302 直链端点（核心）
 # ----------------------------------------------------------------------
 
-def _link_expire(url, default_ttl):
+def _link_expire(url, default_ttl, max_ttl=None):
     """按直链自己的过期时间来决定缓存多久。
 
     移动云盘的直链带 t= 过期时间戳，实测只有约 15 分钟。
     以前一律缓存 2 小时，结果直链早过期了缓存还有效 —— 表现就是
     「播过的视频，过一会儿再播就一直加载」。
     这里直接读 t，留 60 秒余量；读不到才退回默认时长。
+
+    t 有可能是毫秒时间戳（那会被当成 5 万年后的过期时间，
+    缓存永不失效），所以要先做量级校验，超出合理区间就退回默认值。
     """
+    now = time.time()
+    fallback = now + default_ttl
+    if max_ttl:
+        fallback = min(fallback, now + max_ttl)
     try:
         from urllib.parse import urlparse, parse_qs
         t = int(parse_qs(urlparse(url).query).get("t", ["0"])[0])
         if t > 0:
-            return t - 60
+            if t > 1e11:          # 量级明显是毫秒
+                t = t / 1000.0
+            # 只接受「一天之内」的过期时间，超出说明这个 t 不是我们想的那个 t
+            if now - 86400 < t < now + 86400:
+                expire = t - 60
+                if max_ttl:
+                    expire = min(expire, now + max_ttl)
+                # 直链已经（快）过期时也要至少缓存十几秒，否则每次请求都会
+                # 重新换链，播放器一密集请求就把接口打爆了
+                return max(expire, now + 15)
     except Exception:
         pass
-    return time.time() + default_ttl
+    return fallback
+
+
+def _cas_link_dead(key, url):
+    """
+    缓存里的直链是不是已经废了（节流探测，同一个片子最多 60 秒探一次）。
+
+    只在**明确拿到 4xx** 时才判死 —— 网络异常、超时、5xx 一律当作还活着，
+    绝不能让探测抖动变成「不停重新秒传还原」。
+    """
+    now = time.time()
+    if now - _probe_at.get(key, 0) < CAS_PROBE_INTERVAL:
+        return False
+    _probe_at[key] = now
+    try:
+        import requests
+        # 只取 1 个字节，且用 stream 避免把整个视频拉回来
+        resp = requests.get(url, headers={"Range": "bytes=0-0"},
+                            timeout=5, stream=True)
+        code = resp.status_code
+        resp.close()
+    except Exception:
+        return False          # 探不到就不敢断定，继续用
+    return 400 <= code < 500
+
+
+def _cache_put(key, value):
+    """写入直链缓存，顺手清掉已过期的条目（缓存表不能无限长）。"""
+    with _cache_lock:
+        _link_cache[key] = value
+        if len(_link_cache) > 500:
+            now = time.time()
+            for k in [k for k, v in _link_cache.items() if v[1] <= now]:
+                _link_cache.pop(k, None)
 
 
 def _get_link(client, file_id):
@@ -722,8 +776,7 @@ def _get_link(client, file_id):
         if cached and cached[1] > now:
             return cached[0]
     url = client.get_download_url(file_id)
-    with _cache_lock:
-        _link_cache[file_id] = (url, _link_expire(url, LINK_TTL))
+    _cache_put(file_id, (url, _link_expire(url, LINK_TTL)))
     return url
 
 
@@ -751,19 +804,30 @@ def _get_cas_link(client, cfg, file_id, cas_name):
         cached = _link_cache.get(key)
     if cached and len(cached) >= 3 and cached[1] > now:
         url, expire, temp_id = cached[0], cached[1], cached[2]
-        # 还在有效期内 → 直接复用，并把临时文件的寿命续到缓存失效之后
-        restorer.schedule_delete(temp_id, delay=max(60, expire - now + CAS_TEMP_GRACE))
-        return url
+        if not _cas_link_dead(key, url):
+            # 还在有效期内 → 直接复用，并把临时文件的寿命续到缓存失效之后
+            restorer.schedule_delete(
+                temp_id, delay=max(int(restorer.temp_ttl or 0),
+                                   int(expire - now + CAS_TEMP_GRACE)))
+            return url
+        # 直链已经废了（多半是用户在云盘里手动删了临时文件）→ 重建
+        with _cache_lock:
+            _link_cache.pop(key, None)
+        restorer.forget_session(file_id)
+        app.logger.info("缓存的直链已失效（%s），重新还原", cas_name)
 
     url, size, temp_id, real_name, restored = restorer.fetch_link(file_id, cas_name)
-    expire = min(_link_expire(url, LINK_TTL), now + CAS_LINK_MAX_TTL)
-    # 临时文件必须活过缓存：缓存失效后再宽限 CAS_TEMP_GRACE 秒
-    restorer.schedule_delete(temp_id, delay=max(60, expire - now + CAS_TEMP_GRACE))
+    expire = _link_expire(url, LINK_TTL, CAS_LINK_MAX_TTL)
+    # 临时文件必须活过缓存：缓存失效后再宽限 CAS_TEMP_GRACE 秒。
+    # 不能只看 cas_temp_ttl —— 直链 15 分钟后才过期，这期间播放器拿着旧直链
+    # 继续拉流，文件提前删了就会播到一半断掉。
+    restorer.schedule_delete(
+        temp_id, delay=max(int(restorer.temp_ttl or 0),
+                           int(expire - now + CAS_TEMP_GRACE)))
     if restored:
         remember_temp_dir(cfg, restorer.get_temp_dir())
         app.logger.info("CAS 还原成功 %s -> %s (%d 字节)", cas_name, real_name, size)
-    with _cache_lock:
-        _link_cache[key] = (url, expire, temp_id)
+    _cache_put(key, (url, expire, temp_id))
     return url
 
 

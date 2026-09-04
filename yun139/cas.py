@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
 
@@ -96,6 +97,24 @@ def is_cas_name(name):
 def is_video_name(name):
     ext = os.path.splitext(name or "")[1].lower()
     return ext in VIDEO_EXTS
+
+
+# 临时文件名形如 TEMP_<毫秒>_<随机数>_<片名>；云盘在重名时会自动加 " (1)"
+_TEMP_PREFIX_RE = re.compile(r"^TEMP_\d+_\d+_(?P<base>.*)$")
+_RENAME_SUFFIX_RE = re.compile(r"\s*\(\d+\)(?=\.[^.]*$|$)")
+
+
+def temp_base_name(name):
+    """把临时文件名还原成原始片名，用于认出同一部片子的各个副本。
+
+    'TEMP_1756..._01357_电影 (1).mkv' -> '电影.mkv'
+    '电影.mkv'                        -> '电影.mkv'
+    """
+    s = (name or "").strip()
+    m = _TEMP_PREFIX_RE.match(s)
+    if m:
+        s = m.group("base")
+    return _RENAME_SUFFIX_RE.sub("", s)
 
 
 def decode(data):
@@ -424,6 +443,19 @@ class CASRestorer:
         with self._state_lock:
             return {s["temp_id"] for s in self._sessions.values()}
 
+    def _gc_sessions(self):
+        """丢掉过期会话和没人用的单飞锁，避免长期运行后无限增长。"""
+        now = time.time()
+        with self._state_lock:
+            for key in [k for k, s in self._sessions.items()
+                        if now - s["created_at"] > self.max_session_ttl]:
+                self._sessions.pop(key, None)
+            for key in list(self._flight):
+                if key in self._sessions:
+                    continue
+                if not self._flight[key].locked():
+                    self._flight.pop(key, None)
+
     def _purge_leftovers(self, restore_name):
         """
         清掉这部片子残留在临时目录里的其它副本。
@@ -442,12 +474,13 @@ class CASRestorer:
             return 0
         keep = self._active_temp_ids()
         removed = 0
+        target = temp_base_name(restore_name)
         for item in items:
             if item.is_folder or item.file_id in keep:
                 continue
-            # 临时文件名形如 TEMP_<毫秒>_<随机>_<片名>，按片名认人
-            if not (item.name == restore_name
-                    or item.name.endswith("_" + restore_name)):
+            # 按「去掉 TEMP_ 前缀和 (1) 序号后的片名」认人，
+            # 这样云盘自动改过名的副本也能被认出来
+            if not target or temp_base_name(item.name) != target:
                 continue
             self.cancel_delete(item.file_id)
             if self.delete_quietly(item.file_id):
@@ -497,9 +530,15 @@ class CASRestorer:
                     "created_at": time.time(),
                 }
             self._purge_leftovers(base_name)
+            self._gc_sessions()
             logger.info("已秒传还原 %s -> %s（临时文件 %s）",
                         cas_name, real_name, temp_id)
             return link, size, temp_id, real_name, True
+
+    def forget_session(self, cas_file_id):
+        """丢掉这个 .cas 的还原会话（直链失效、需要强制重建时用）。"""
+        with self._state_lock:
+            return self._sessions.pop(cas_file_id, None)
 
     def session_count(self):
         """当前保持着的还原会话数量。"""
