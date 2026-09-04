@@ -196,6 +196,9 @@ class CASRestorer:
         self._temp_dir_id = None
         self._lock = threading.Lock()
         self._pending = {}
+        # 临时文件到期时间表：用独立锁保护，避免和 _lock 互相等待
+        self._pending_lock = threading.Lock()
+        self._reaper = None
 
     # ------------------------------------------------------------------
     # 解析
@@ -382,19 +385,42 @@ class CASRestorer:
             return False
 
     def schedule_delete(self, file_id, delay=None):
-        """延迟删除临时文件，给播放器留出开始缓冲的时间。"""
+        """登记临时文件的延迟删除时间（到点由后台清理线程删掉）。
+
+        对同一个文件重复调用 = **续期**：只推迟删除时间，不会再起新线程。
+        旧实现每次调用都新起一个线程，导致续期之后旧线程仍会按时把文件删掉，
+        表现就是「播过的视频，过一会儿再播就一直加载」。
+        """
         delay = self.temp_ttl if delay is None else delay
-        self._pending[file_id] = time.time() + delay
-
-        def _worker():
-            time.sleep(delay)
-            self._pending.pop(file_id, None)
-            self.delete_quietly(file_id)
-
-        t = threading.Thread(target=_worker, name=f"cas-clean-{file_id[:8]}",
-                             daemon=True)
-        t.start()
+        with self._pending_lock:
+            self._pending[file_id] = time.time() + delay
+        self._ensure_reaper()
         return delay
+
+    def _ensure_reaper(self):
+        """保证后台清理线程只起一次。"""
+        with self._pending_lock:
+            if self._reaper is not None and self._reaper.is_alive():
+                return
+            self._reaper = threading.Thread(target=self._reap_loop,
+                                            name="cas-reaper", daemon=True)
+            self._reaper.start()
+
+    def _reap_loop(self):
+        """每 10 秒检查一次，删掉到期的临时文件。"""
+        while True:
+            try:
+                time.sleep(10)
+                now = time.time()
+                with self._pending_lock:
+                    due = [fid for fid, exp in list(self._pending.items())
+                           if exp <= now]
+                    for fid in due:
+                        self._pending.pop(fid, None)
+                for fid in due:
+                    self.delete_quietly(fid)
+            except Exception as exc:
+                logger.warning("临时文件清理线程异常: %s", exc)
 
     def purge_temp_dir(self, max_age=None):
         """
@@ -423,4 +449,6 @@ class CASRestorer:
     def pending_count(self):
         """当前等待延迟删除的临时文件数量。"""
         now = time.time()
-        return sum(1 for exp in self._pending.values() if exp > now)
+        with self._pending_lock:
+            snapshot = list(self._pending.values())
+        return sum(1 for exp in snapshot if exp > now)

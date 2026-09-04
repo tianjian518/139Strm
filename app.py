@@ -35,6 +35,12 @@ _link_cache = {}
 _cache_lock = threading.Lock()
 LINK_TTL = 2 * 3600  # 直链有时效，缓存 2 小时
 
+# CAS 直链指向的是「秒传还原出来的临时文件」，而临时文件默认 5 分钟后就删了。
+# 所以 CAS 直链只能短缓存，仅用于吸收同一次播放里的重试/并发请求；
+# 缓存久了就会拿到指向已删文件的旧地址 —— 表现就是「播过的再播一直加载」。
+# 超过这个时间再播放，一律重新秒传还原，等价于一出新片，拿到的必然是新鲜地址。
+CAS_LINK_TTL = 60
+
 # 后台生成任务（队列式：可串行执行多个任务）
 _task_state = {
     "running": False,
@@ -690,6 +696,24 @@ def api_strm_status():
 # 302 直链端点（核心）
 # ----------------------------------------------------------------------
 
+def _link_expire(url, default_ttl):
+    """按直链自己的过期时间来决定缓存多久。
+
+    移动云盘的直链带 t= 过期时间戳，实测只有约 15 分钟。
+    以前一律缓存 2 小时，结果直链早过期了缓存还有效 —— 表现就是
+    「播过的视频，过一会儿再播就一直加载」。
+    这里直接读 t，留 60 秒余量；读不到才退回默认时长。
+    """
+    try:
+        from urllib.parse import urlparse, parse_qs
+        t = int(parse_qs(urlparse(url).query).get("t", ["0"])[0])
+        if t > 0:
+            return t - 60
+    except Exception:
+        pass
+    return time.time() + default_ttl
+
+
 def _get_link(client, file_id):
     now = time.time()
     with _cache_lock:
@@ -698,31 +722,61 @@ def _get_link(client, file_id):
             return cached[0]
     url = client.get_download_url(file_id)
     with _cache_lock:
-        _link_cache[file_id] = (url, now + LINK_TTL)
+        _link_cache[file_id] = (url, _link_expire(url, LINK_TTL))
     return url
+
+
+def _cas_link_alive(url):
+    """缓存里的直链还能不能用（临时文件可能已被删、或签名过期）。
+
+    返回 True / False；网络异常时不敢断定，返回 None。
+    """
+    try:
+        import requests
+        resp = requests.head(url, timeout=8, allow_redirects=True)
+        return resp.status_code < 400
+    except Exception:
+        return None
 
 
 def _get_cas_link(client, cfg, file_id, cas_name):
     """
     .cas 文件的播放直链：先秒传还原出临时文件，取直链后延迟删除临时文件。
 
-    结果同样进缓存，避免拖动进度条时反复秒传。
+    这个直链指向的是「还原出来的临时文件」，文件一删链接就废。
+    所以这里只做很短的缓存（吸收同一次播放里的重试/并发请求）；
+    超过缓存时间再播放，就重新秒传还原 —— 等价于一出新片，地址一定是新鲜的。
+    停止播放后不再有请求，临时文件到点自动清掉，不残留。
     """
     now = time.time()
     key = "cas:" + file_id
+    restorer = get_restorer(cfg, client)
+    # 缓存必须远短于临时文件存活时间，这里取两者更小值并留足余量
+    cas_ttl = max(15, min(CAS_LINK_TTL, int(restorer.temp_ttl) // 2))
+
     with _cache_lock:
         cached = _link_cache.get(key)
-        if cached and cached[1] > now:
-            return cached[0]
+    if cached and len(cached) >= 3 and cached[1] > now:
+        url, _expire, temp_id = cached[0], cached[1], cached[2]
+        if _cas_link_alive(url) is not False:
+            # 还在用 → 续期，避免连续播放播到一半被清掉
+            restorer.schedule_delete(temp_id)
+            with _cache_lock:
+                _link_cache[key] = (url, min(now + cas_ttl,
+                                             _link_expire(url, LINK_TTL)), temp_id)
+            return url
+        # 已失效（临时文件被清 / 签名过期）→ 丢掉缓存，下面重新还原
+        with _cache_lock:
+            _link_cache.pop(key, None)
+        app.logger.info("缓存的 CAS 直链已失效，重新还原：%s", cas_name)
 
-    restorer = get_restorer(cfg, client)
     url, size, temp_id, real_name = restorer.restore_temp(file_id, cas_name)
-    # 临时文件延迟删除，给播放器留出开始缓冲的时间
+    # 延迟删除：给播放器留出开始缓冲的时间；播放中再次请求会自动续期
     restorer.schedule_delete(temp_id)
     remember_temp_dir(cfg, restorer.get_temp_dir())
 
     with _cache_lock:
-        _link_cache[key] = (url, now + LINK_TTL)
+        _link_cache[key] = (url, now + cas_ttl, temp_id)
     app.logger.info("CAS 还原成功 %s -> %s (%d 字节)", cas_name, real_name, size)
     return url
 
