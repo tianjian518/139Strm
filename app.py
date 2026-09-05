@@ -817,6 +817,15 @@ def _get_cas_link(client, cfg, file_id, cas_name):
         app.logger.info("缓存的直链已失效（%s），重新还原", cas_name)
 
     url, size, temp_id, real_name, restored = restorer.fetch_link(file_id, cas_name)
+    if not restored and _cas_link_dead(key, url):
+        # 复用的旧会话可能指向已经不在了的临时文件（隔天续播、
+        # 用户在云盘里手动删了临时文件等）。取直链接口对不存在的文件
+        # 照样签发 URL —— 不探一下就会把死链发给播放器，表现是
+        # 「隔天继续播放一直加载中，返回重播才正常」。
+        restorer.forget_session(file_id)
+        app.logger.info("复用的临时直链已失效（%s），强制重新还原", cas_name)
+        url, size, temp_id, real_name, restored = restorer.fetch_link(
+            file_id, cas_name)
     expire = _link_expire(url, LINK_TTL, CAS_LINK_MAX_TTL)
     # 临时文件必须活过缓存：缓存失效后再宽限 CAS_TEMP_GRACE 秒。
     # 不能只看 cas_temp_ttl —— 直链 15 分钟后才过期，这期间播放器拿着旧直链

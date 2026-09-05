@@ -438,6 +438,22 @@ class CASRestorer:
         with self._state_lock:
             return self._sessions.pop(cas_file_id, None)
 
+    def _drop_session_by_temp_id(self, temp_id):
+        """临时文件被删掉后，把引用它的还原会话一并清掉。
+
+        以前清理线程删完文件就把会话留在内存里（会话要 12 小时才过期），
+        隔天续播时 _refresh_link 会对着这个已删的 temp_id 去取直链 ——
+        取直链接口对不存在的文件照样签发一条 URL，但文件已经不在了。
+        播放器拿到死链就一直加载，返回重播才走重建。表现就是
+        「播一半退出，隔天继续播放一直加载中，重新播放才正常」。
+        """
+        with self._state_lock:
+            dropped = [k for k, s in self._sessions.items()
+                       if s["temp_id"] == temp_id]
+            for k in dropped:
+                self._sessions.pop(k, None)
+        return bool(dropped)
+
     def _active_temp_ids(self):
         """所有正在被复用（不该被清扫）的临时文件 ID。"""
         with self._state_lock:
@@ -563,6 +579,7 @@ class CASRestorer:
         try:
             self.client.personal_delete([file_id])
             logger.info("已清理临时文件 %s", file_id)
+            self._drop_session_by_temp_id(file_id)
             with self._state_lock:
                 self._delete_failures.pop(file_id, None)
             return True
@@ -570,6 +587,7 @@ class CASRestorer:
             if trashed:
                 logger.info("临时文件 %s 已进回收站，彻底删除失败（可忽略）: %s",
                             file_id, exc)
+                self._drop_session_by_temp_id(file_id)
                 with self._state_lock:
                     self._delete_failures.pop(file_id, None)
                 return True
