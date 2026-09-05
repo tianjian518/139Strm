@@ -152,6 +152,50 @@ def build_client(cfg=None):
     )
 
 
+# 已初始化的云盘 client 按「账号配置」缓存。
+#
+# 原来 direct_link 每个请求都 build_client + init，而 init 里有一次
+# qryRoutePolicy 接口往返，还要新建 TCP/TLS 会话。换集点播这种冷启动
+# 请求（init + 秒传 + 取直链 + 清扫）要串行 4~5 次接口，播放器等不到
+# 就「点下一集一直加载中，返回重播秒开」（重播时还原缓存已就绪）。
+# 缓存 client 后命中请求 0 次 init 往返，连接也可复用。
+_clients = {}
+_clients_lock = threading.Lock()
+_CLIENT_TTL = 3600          # 定期重建，给 refresh_token 留出续期机会
+
+
+def _client_key(cfg):
+    return "|".join(str(cfg.get(k, "")) for k in
+                    ("authorization", "cloud_type", "cloud_id", "username"))
+
+
+def get_client(cfg):
+    """取缓存好的 client；没有就用当前配置新建并 init。
+
+    cfg 变化（换号/改配置）会得到不同的 key，自动各建各的；
+    init 失败不会缓存，下次请求重新 init。
+    """
+    key = _client_key(cfg)
+    now = time.time()
+    with _clients_lock:
+        entry = _clients.get(key)
+        if entry and now - entry[1] < _CLIENT_TTL:
+            return entry[0]
+    client = build_client(cfg)
+    client.init()
+    with _clients_lock:
+        _clients[key] = (client, time.time())
+        for k in [k for k in _clients if k != key]:   # 只留当前账号
+            _clients.pop(k, None)
+    return client
+
+
+def drop_client(cfg):
+    """丢掉缓存的 client（凭据失效 / 接口异常时重建用）。"""
+    with _clients_lock:
+        _clients.pop(_client_key(cfg), None)
+
+
 # CAS 秒传还原器（按 authorization 缓存，换号自动重建）
 _restorers = {}
 _restorer_lock = threading.Lock()
@@ -840,6 +884,18 @@ def _get_cas_link(client, cfg, file_id, cas_name):
     return url
 
 
+_CAS_FATAL_MARKS = ("权益不足", "不是视频", "已失效无法还原", "SHA256",
+                    "秒传失败", "请手动删除")
+
+
+def _cas_error_is_final(exc):
+    """这类 CAS 业务错误重试也不会成功（账号权益 / 文件本身的问题）。"""
+    if not isinstance(exc, CASError):
+        return False
+    msg = str(exc)
+    return any(m in msg for m in _CAS_FATAL_MARKS)
+
+
 @app.route("/d/<path:file_id>", methods=["GET", "HEAD"])
 def direct_link(file_id):
     """
@@ -853,17 +909,34 @@ def direct_link(file_id):
         return Response("尚未配置移动云盘 Authorization", status=503)
 
     cas_name = request.args.get("cas") or ""
-    try:
-        client = build_client(cfg)
-        client.init()
-        if cas_name and is_cas_name(cas_name) and cfg.get("cas_enabled", True):
-            url = _get_cas_link(client, cfg, file_id, cas_name)
-        else:
-            url = _get_link(client, file_id)
-    except (Yun139Error, CASError) as exc:
+    use_cas = (bool(cas_name) and is_cas_name(cas_name)
+               and cfg.get("cas_enabled", True))
+    url, last_exc = None, None
+    for attempt in (1, 2):
+        try:
+            if attempt == 1:
+                client = get_client(cfg)
+            else:
+                # 第一次失败：缓存的 client 可能 token/接入地址已失效，
+                # 丢掉缓存全新 init 再试一次；云盘接口偶发抖动也靠这一搏。
+                # 点「下一集」这种冷启动请求不该让用户「返回重播」才成功。
+                drop_client(cfg)
+                client = build_client(cfg)
+                client.init()
+            url = (_get_cas_link(client, cfg, file_id, cas_name) if use_cas
+                   else _get_link(client, file_id))
+            break
+        except (Yun139Error, CASError) as exc:
+            last_exc = exc
+            if attempt == 2 or _cas_error_is_final(exc):
+                break
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 2:
+                break
+    if url is None:
+        exc = last_exc
         return Response(f"获取直链失败: {exc}", status=502)
-    except Exception as exc:
-        return Response(f"获取直链失败: {type(exc).__name__}: {exc}", status=502)
 
     resp = redirect(url, code=302)
     resp.headers["Cache-Control"] = "no-store"
@@ -876,8 +949,7 @@ def api_link(file_id):
     cfg = load_config()
     cas_name = request.args.get("cas") or ""
     try:
-        client = build_client(cfg)
-        client.init()
+        client = get_client(cfg)
         if cas_name and is_cas_name(cas_name):
             url = _get_cas_link(client, cfg, file_id, cas_name)
         else:

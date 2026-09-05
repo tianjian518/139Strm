@@ -54,6 +54,13 @@ DEFAULT_TEMP_TTL = 300
 # 超过这个时长后下次播放强制重新秒传还原，避免长时间复用同一份临时文件。
 MAX_SESSION_TTL = 12 * 3600
 
+# 临时目录 ID 的确认结果缓存多久（秒）。以前每次还原都 list 一次根目录
+# 确认目录还在 —— 换集点播这种冷启动路径上每多一次接口往返，
+# 播放器就多一分「一直加载中」的超时风险。60 秒内用户恰好删掉
+# 临时目录的概率可以忽略；真删了，秒传会失败并触发强制重查（见
+# _create_in_temp_dir），不会卡死。
+DIR_CHECK_INTERVAL = 60
+
 VIDEO_EXTS = (
     ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".ts", ".m2ts",
     ".wmv", ".rmvb", ".m4v", ".mpg", ".mpeg", ".3gp",
@@ -226,6 +233,11 @@ class CASRestorer:
         # 播放中反复请求直链时，只复用这里的临时文件重新取一次直链，
         # 绝不重新秒传还原 —— 否则一部电影会被反复还原出几十 GB。
         self._sessions = {}
+        # 后台清扫去重：同一片名同时只跑一个清扫线程
+        self._sweeping = set()
+        self._sweep_lock = threading.Lock()
+        # 临时目录 ID 上次确认的时间（节流，见 DIR_CHECK_INTERVAL）
+        self._dir_checked_at = 0.0
         # 每个 cas 文件的还原单飞锁，避免并发请求各还原一份
         self._flight = {}
         self._state_lock = threading.Lock()
@@ -271,6 +283,12 @@ class CASRestorer:
         播放全部失败，所以必须拿到当前真实存在的目录 ID。
         """
         with self._lock:
+            # 刚确认过就直接沿用缓存 ID（节流）：换集点播的等待路径上
+            # 省一次 list 往返。目录真被删掉的场景由 _create_in_temp_dir
+            # 的「失败后强制重查重试」兜底，不会卡死。
+            if (self._temp_dir_id
+                    and time.time() - self._dir_checked_at < DIR_CHECK_INTERVAL):
+                return self._temp_dir_id
             try:
                 found = self._scan_temp_dir()
             except Exception as exc:
@@ -285,6 +303,7 @@ class CASRestorer:
                     logger.warning("临时目录 ID 已变化 %s -> %s，已自动更新",
                                    self._temp_dir_id, found)
                 self._temp_dir_id = found
+                self._dir_checked_at = time.time()
                 return found
 
             root = self.client.root_folder_id
@@ -312,6 +331,7 @@ class CASRestorer:
                 )
 
             self._temp_dir_id = file_id
+            self._dir_checked_at = time.time()
             logger.info("已创建临时目录 %s (%s)", self.temp_dir_name, file_id)
             return file_id
 
@@ -366,6 +386,37 @@ class CASRestorer:
             raise CASError(f"秒传还原未返回文件 ID: {resp}")
         return file_id, (data.get("fileName") or name)
 
+    def _create_in_temp_dir(self, temp_name, info):
+        """在临时目录里秒传还原；目录 ID 失效（被用户删掉等）时强制重查重试一次。
+
+        ensure_temp_dir 有 60 秒确认节流：目录恰在节流期内被删的话，
+        第一次 create 会失败 —— 这里清掉缓存 ID 强制重查再来，不会卡死。
+        只对「沿用了超过确认间隔的旧 ID」重查：ID 刚确认过还存在的话，
+        create 失败多半是账号权益/秒传源数据这类业务原因，重查无济于事。
+        """
+        last_exc = None
+        for attempt in (1, 2):
+            with self._lock:
+                stale = (self._temp_dir_id is not None
+                         and time.time() - self._dir_checked_at
+                         >= DIR_CHECK_INTERVAL)
+            dir_id = self.ensure_temp_dir()
+            try:
+                fid, real_name = self._create_by_sha256(
+                    dir_id, temp_name, info.size, info.sha256
+                )
+                return fid, real_name, dir_id
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 2 or not stale:
+                    raise
+                with self._lock:
+                    self._temp_dir_id = None
+                    self._dir_checked_at = 0.0
+                logger.warning("秒传失败（%s），临时目录 ID 已超过确认间隔，"
+                               "强制重查后重试", exc)
+        raise last_exc
+
     def restore_temp(self, cas_file_id, cas_name):
         """
         把 .cas 还原成临时目录里的一个真文件。
@@ -388,12 +439,15 @@ class CASRestorer:
         temp_name = "TEMP_%d_%05d_%s" % (
             int(time.time() * 1000), random.randint(0, 99999), preview_name
         )
-        temp_id, real_name = self._create_by_sha256(
-            temp_dir, temp_name, info.size, info.sha256
-        )
+        temp_id, real_name, temp_dir = self._create_in_temp_dir(temp_name, info)
         logger.info("已秒传还原 %s -> %s (%s)", cas_name, real_name, temp_id)
 
-        link = self.client.personal_get_link(temp_id)
+        try:
+            link = self.client.personal_get_link(temp_id)
+        except Exception:
+            # 取不到直链就别把刚还原的文件留在云盘里占地方
+            self.delete_quietly(temp_id)
+            raise
         if not link:
             self.delete_quietly(temp_id)
             raise CASError("还原成功但未能取得直链")
@@ -472,6 +526,45 @@ class CASRestorer:
                 if not self._flight[key].locked():
                     self._flight.pop(key, None)
 
+    def _purge_leftovers_async(self, base_name):
+        """在后台线程清扫这部片子的旧副本，不阻塞还原返回。
+
+        同一片名同一时刻只跑一个清扫；清扫走的 delete_quietly 自带
+        失败重试和「删完清会话」，与同步版行为完全一致。
+        """
+        if not base_name:
+            return
+        with self._sweep_lock:
+            if base_name in self._sweeping:
+                return
+            self._sweeping.add(base_name)
+
+        def _work():
+            try:
+                self._purge_leftovers(base_name)
+            except Exception as exc:
+                logger.warning("后台清扫 %s 旧副本异常（忽略）: %s", base_name, exc)
+            finally:
+                with self._sweep_lock:
+                    self._sweeping.discard(base_name)
+
+        threading.Thread(target=_work, name="cas-sweep", daemon=True).start()
+
+    def wait_sweeps(self, timeout=5.0):
+        """等所有后台清扫结束（测试用）。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._sweep_lock:
+                if not self._sweeping:
+                    return True
+            real_sleep = getattr(time, "real_sleep", None)
+            if real_sleep:
+                real_sleep(0.02)
+            else:
+                time.sleep(0.02)
+        with self._sweep_lock:
+            return not self._sweeping
+
     def _purge_leftovers(self, restore_name):
         """
         清掉这部片子残留在临时目录里的其它副本。
@@ -545,7 +638,9 @@ class CASRestorer:
                     "size": size,
                     "created_at": time.time(),
                 }
-            self._purge_leftovers(base_name)
+            # 清扫旧副本放后台：点「下一集」这类冷启动请求，
+            # 返回前的每次同步接口调用都在给播放器的超时添筹码
+            self._purge_leftovers_async(base_name)
             self._gc_sessions()
             logger.info("已秒传还原 %s -> %s（临时文件 %s）",
                         cas_name, real_name, temp_id)
