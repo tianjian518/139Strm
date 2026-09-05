@@ -52,7 +52,14 @@ DEFAULT_TEMP_TTL = 300
 
 # 一个已还原的临时文件最多被复用多久（秒）。
 # 超过这个时长后下次播放强制重新秒传还原，避免长时间复用同一份临时文件。
-MAX_SESSION_TTL = 12 * 3600
+# 曾经是 12 小时：隔夜续播时（<12h）会照旧复用昨晚那一份临时文件 ——
+# 但旧实体在云盘侧过一夜可能出状况（删除重试留下的残骸、秒传引用被
+# 云盘整理后失效、CDN 对它返回 200 却播不出来），表现为「昨天最后看的
+# 那部，今天早上第一次点播一直加载中，返回重播才正常」（前面几部都
+# 正常，因为它们的文件昨晚已删干净，走的是全新秒传）。砍到 4 小时：
+# 隔夜/白天长间隔一律重新秒传 —— 与「没问题的那些」同一条可靠路径；
+# 4 小时以内的暂停复用不受影响，多出的那次秒传是秒回的，无感知。
+MAX_SESSION_TTL = 4 * 3600
 
 # 临时目录 ID 的确认结果缓存多久（秒）。以前每次还原都 list 一次根目录
 # 确认目录还在 —— 换集点播这种冷启动路径上每多一次接口往返，
@@ -627,6 +634,22 @@ class CASRestorer:
             self._exist_cache[temp_id] = (exists, now)
         return exists
 
+    def _reuse_link(self, cas_file_id, cas_name, sess):
+        """复用已还原的临时文件重新取直链；返回直链或空串。
+
+        取不到链时顺手丢弃会话。复用超过 1 小时的会话记一条日志 ——
+        万一旧实体在云盘侧过夜出了状况（残骸/引用失效/CDN 假活），
+        这条日志就是排查「隔天第一播卡住」的第一现场。
+        """
+        age = time.time() - sess["created_at"]
+        if age > 3600:
+            logger.info("复用 %.1f 小时前的还原会话: %s（临时文件 %s）",
+                        age / 3600, cas_name, sess["temp_id"])
+        link = self._refresh_link(sess["temp_id"])
+        if not link:
+            self._drop_session(cas_file_id)
+        return link
+
     def fetch_link(self, cas_file_id, cas_name):
         """
         取得 .cas 的播放直链：**能复用就复用**。
@@ -648,10 +671,9 @@ class CASRestorer:
             self._drop_session(cas_file_id)
             sess = None
         if sess:
-            link = self._refresh_link(sess["temp_id"])
+            link = self._reuse_link(cas_file_id, cas_name, sess)
             if link:
                 return link, sess["size"], sess["temp_id"], sess["name"], False
-            self._drop_session(cas_file_id)
 
         # 单飞：并发请求只让第一个去还原，其余的等它出结果后直接复用
         with self._flight_lock(cas_file_id):
@@ -662,10 +684,9 @@ class CASRestorer:
                 self._drop_session(cas_file_id)
                 sess = None
             if sess:
-                link = self._refresh_link(sess["temp_id"])
+                link = self._reuse_link(cas_file_id, cas_name, sess)
                 if link:
                     return link, sess["size"], sess["temp_id"], sess["name"], False
-                self._drop_session(cas_file_id)
 
             link, size, temp_id, real_name, base_name = self.restore_temp(
                 cas_file_id, cas_name
@@ -777,16 +798,33 @@ class CASRestorer:
                 for fid in due:
                     if self.delete_quietly(fid):
                         continue
+                    give_up = False
                     with self._state_lock:
                         tries = self._delete_failures.get(fid, 0) + 1
-                        if tries > 6:
+                        if tries > 8:
                             self._delete_failures.pop(fid, None)
-                            logger.error("临时文件 %s 连续 %d 次删除失败，放弃",
-                                         fid, tries)
-                            continue
-                        self._delete_failures[fid] = tries
+                            give_up = True
+                        else:
+                            self._delete_failures[fid] = tries
+                    if give_up:
+                        # 这个实体已经处于「139 侧删不掉」的异常状态，
+                        # 不再允许任何会话复用它 —— 否则隔夜续播会
+                        # 复用一份出过状况的旧文件。作废会话后，
+                        # 下次播放走全新秒传（被证明可靠的路径），
+                        # 还原后的同名清扫还会再尝试删掉这个残骸。
+                        # 注意作废必须在 _state_lock 之外调：
+                        # _drop_session_by_temp_id 自己要拿同一把锁
+                        # （不可重入，锁内调用 = 自我死锁）。
+                        logger.error("临时文件 %s 连续 %d 次删除失败，放弃；"
+                                     "同步作废引用它的还原会话", fid, tries)
+                        self._drop_session_by_temp_id(fid)
+                        continue
                     with self._pending_lock:
-                        self._pending[fid] = now + 60 * tries
+                        # 平方退避、30 分钟封顶：夜间接口抖动的恢复窗口
+                        # 从原来的 ~20 分钟拉长到 ~2.5 小时，避免一次
+                        # 深夜故障就留下永久残骸
+                        self._pending[fid] = now + min(60 * tries * tries,
+                                                       1800)
             except Exception as exc:
                 logger.warning("临时文件清理线程异常: %s", exc)
 
