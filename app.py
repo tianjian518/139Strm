@@ -912,7 +912,10 @@ def direct_link(file_id):
     use_cas = (bool(cas_name) and is_cas_name(cas_name)
                and cfg.get("cas_enabled", True))
     url, last_exc = None, None
+    attempts = 0
+    t0 = time.time()
     for attempt in (1, 2):
+        attempts = attempt
         try:
             if attempt == 1:
                 client = get_client(cfg)
@@ -936,7 +939,16 @@ def direct_link(file_id):
                 break
     if url is None:
         exc = last_exc
+        app.logger.info("直链获取失败 cas=%s file=%s 耗时=%.1fs 尝试=%d: %s",
+                        cas_name, file_id, time.time() - t0, attempts, exc)
         return Response(f"获取直链失败: {exc}", status=502)
+
+    took = time.time() - t0
+    if took > 2:
+        # 慢请求落日志：用户「一直加载中」时，能从日志直接看到
+        # 是哪部片子、花了多久、重试了几次
+        app.logger.info("直链获取较慢 cas=%s file=%s 耗时=%.1fs 尝试=%d",
+                        cas_name, file_id, took, attempts)
 
     resp = redirect(url, code=302)
     resp.headers["Cache-Control"] = "no-store"
