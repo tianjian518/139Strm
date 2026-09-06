@@ -786,6 +786,9 @@ def _cas_link_dead(key, url):
 
     只在**明确拿到 4xx** 时才判死 —— 网络异常、超时、5xx 一律当作还活着，
     绝不能让探测抖动变成「不停重新秒传还原」。
+    额外判死一类「假活」：Range 请求要 1 个字节，正常应答是 206 或
+    带非零 Content-Length 的 200；如果返回 200 却没有长度或长度为 0，
+    说明 CDN 在对一个坏文件敷衍 —— 也判死，别让播放器去转圈。
     """
     now = time.time()
     if now - _probe_at.get(key, 0) < CAS_PROBE_INTERVAL:
@@ -797,10 +800,29 @@ def _cas_link_dead(key, url):
         resp = requests.get(url, headers={"Range": "bytes=0-0"},
                             timeout=5, stream=True)
         code = resp.status_code
+        if 400 <= code < 500:
+            resp.close()
+            return True
+        if 200 <= code < 300:
+            length = (resp.headers.get("Content-Length") or "").strip()
+            content_range = (resp.headers.get("Content-Range") or "").strip()
+            chunked = "chunked" in (resp.headers.get("Transfer-Encoding")
+                                    or "").lower()
+            resp.close()
+            if code == 206:
+                return False          # 206：老老实实给了 1 字节 → 活
+            if chunked:
+                return False          # chunked 编码没有 Content-Length 是正常的
+            # 200：要么带非零总长度，要么就是敷衍
+            if length not in ("", "0"):
+                return False
+            if content_range:
+                return False          # 200 + Content-Range 也算诚实应答
+            return True               # 200 但无任何长度信息 → 假活，判死
         resp.close()
     except Exception:
         return False          # 探不到就不敢断定，继续用
-    return 400 <= code < 500
+    return False              # 5xx 等：一律保守判活，不让探测抖动引发反复秒传
 
 
 def _cache_put(key, value):

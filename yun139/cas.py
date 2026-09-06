@@ -650,6 +650,35 @@ class CASRestorer:
             self._drop_session(cas_file_id)
         return link
 
+    def _take_reusable_session(self, cas_file_id, cas_name):
+        """取出一个**还能放心复用**的还原会话；不能复用就地作废并返回 None。
+
+        三道前置检查，任何一道不过都丢弃会话、走全新秒传：
+          1. 会话未过 TTL（_session_valid）；
+          2. 登记的临时文件没在删除失败重试名单里 —— 139 侧已经对
+             这个实体报过异常了，不再复用（否则用户点播放要靠
+             「返回重播」来自愈），直接重新秒传；
+          3. 临时文件在云盘里真实存在（_temp_file_exists）。
+        """
+        sess = self._session_valid(cas_file_id)
+        if not sess:
+            return None
+        with self._state_lock:
+            failing = sess["temp_id"] in self._delete_failures
+        if failing:
+            logger.info("会话的临时文件正在删除失败重试中，丢弃会话重新还原: %s",
+                        cas_name)
+            self._drop_session(cas_file_id)
+            return None
+        if not self._temp_file_exists(sess["temp_id"]):
+            # 会话登记的临时文件在云盘里已经不存在（不管什么原因）：
+            # 不信任这个会话，丢弃后重新秒传 —— 存在性是云盘侧的权威判断，
+            # 比 CDN 探测更硬（CDN 对死文件返回 200 也能兜住）
+            logger.info("会话的临时文件已不在云盘，丢弃会话重新还原: %s", cas_name)
+            self._drop_session(cas_file_id)
+            return None
+        return sess
+
     def fetch_link(self, cas_file_id, cas_name):
         """
         取得 .cas 的播放直链：**能复用就复用**。
@@ -662,14 +691,7 @@ class CASRestorer:
           1. 已有还原好的临时文件 → 换一条新直链即可，零新增文件；
           2. 临时文件确实没了 → 才重新秒传，且先清掉这部片子的旧副本。
         """
-        sess = self._session_valid(cas_file_id)
-        if sess and not self._temp_file_exists(sess["temp_id"]):
-            # 会话登记的临时文件在云盘里已经不存在（不管什么原因）：
-            # 不信任这个会话，丢弃后重新秒传 —— 存在性是云盘侧的权威判断，
-            # 比 CDN 探测更硬（CDN 对死文件返回 200 也能兜住）
-            logger.info("会话的临时文件已不在云盘，丢弃会话重新还原: %s", cas_name)
-            self._drop_session(cas_file_id)
-            sess = None
+        sess = self._take_reusable_session(cas_file_id, cas_name)
         if sess:
             link = self._reuse_link(cas_file_id, cas_name, sess)
             if link:
@@ -677,12 +699,7 @@ class CASRestorer:
 
         # 单飞：并发请求只让第一个去还原，其余的等它出结果后直接复用
         with self._flight_lock(cas_file_id):
-            sess = self._session_valid(cas_file_id)
-            if sess and not self._temp_file_exists(sess["temp_id"]):
-                logger.info("会话的临时文件已不在云盘，丢弃会话重新还原: %s",
-                            cas_name)
-                self._drop_session(cas_file_id)
-                sess = None
+            sess = self._take_reusable_session(cas_file_id, cas_name)
             if sess:
                 link = self._reuse_link(cas_file_id, cas_name, sess)
                 if link:
