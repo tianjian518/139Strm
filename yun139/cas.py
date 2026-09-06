@@ -50,16 +50,21 @@ TEMP_DIR_NAME = "139STRM_TEMP"
 # 不能立刻删：播放器拿到 302 之后才会真正发起带 Range 的请求
 DEFAULT_TEMP_TTL = 300
 
-# 一个已还原的临时文件最多被复用多久（秒）。
-# 超过这个时长后下次播放强制重新秒传还原，避免长时间复用同一份临时文件。
-# 曾经是 12 小时：隔夜续播时（<12h）会照旧复用昨晚那一份临时文件 ——
-# 但旧实体在云盘侧过一夜可能出状况（删除重试留下的残骸、秒传引用被
-# 云盘整理后失效、CDN 对它返回 200 却播不出来），表现为「昨天最后看的
-# 那部，今天早上第一次点播一直加载中，返回重播才正常」（前面几部都
-# 正常，因为它们的文件昨晚已删干净，走的是全新秒传）。砍到 4 小时：
-# 隔夜/白天长间隔一律重新秒传 —— 与「没问题的那些」同一条可靠路径；
-# 4 小时以内的暂停复用不受影响，多出的那次秒传是秒回的，无感知。
-MAX_SESSION_TTL = 4 * 3600
+# 一个已还原的临时文件允许被复用多久（秒）。
+# v2.2.0 起这是个**幂等窗口**，不再是"复用时代"的入场券：
+#   * 90 秒足够覆盖 Emby/播放器的「先探测后播放」两次请求、
+#     并发去重、直链假活后的换链重建 —— 这些场景复用旧实体可省一次秒传；
+#   * 换链（直链 15 分钟过期后回来取新链）时窗口早已关闭，
+#     一律走**全新秒传** —— 这正是 OpenList 魔改版 139cas（openlist-
+#     guangyapan-src）被生产验证顺畅的模式：每次播放请求即秒传即取链，
+#     零历史状态可依赖，也就没有任何"旧实体出状况"的坑可踩。
+# 历史：曾 12 小时（隔夜续播复用旧实体 → 「昨天最后看的部今天早上
+# 必卡」）→ 4 小时（v2.1.12）→ 90 秒（v2.2.0）。复用窗口越短，
+# 能出状况的状态存活期就越短；90 秒内文件刚创建、几乎不可能出状况。
+SESSION_TTL = 90
+
+# 兼容旧名（外部若有引用）
+MAX_SESSION_TTL = SESSION_TTL
 
 # 临时目录 ID 的确认结果缓存多久（秒）。以前每次还原都 list 一次根目录
 # 确认目录还在 —— 换集点播这种冷启动路径上每多一次接口往返，
@@ -253,7 +258,7 @@ class CASRestorer:
         self._state_lock = threading.Lock()
         # 删除失败的临时文件重试次数
         self._delete_failures = {}
-        self.max_session_ttl = MAX_SESSION_TTL
+        self.max_session_ttl = SESSION_TTL
 
     # ------------------------------------------------------------------
     # 解析
@@ -637,14 +642,14 @@ class CASRestorer:
     def _reuse_link(self, cas_file_id, cas_name, sess):
         """复用已还原的临时文件重新取直链；返回直链或空串。
 
-        取不到链时顺手丢弃会话。复用超过 1 小时的会话记一条日志 ——
-        万一旧实体在云盘侧过夜出了状况（残骸/引用失效/CDN 假活），
-        这条日志就是排查「隔天第一播卡住」的第一现场。
+        取不到链时顺手丢弃会话。幂等窗口只有 90 秒，正常复用
+        （探测后播放、并发请求）间隔是秒级 —— 超过 60 秒的复用
+        记一条日志，万一真出了状况它就是第一现场。
         """
         age = time.time() - sess["created_at"]
-        if age > 3600:
-            logger.info("复用 %.1f 小时前的还原会话: %s（临时文件 %s）",
-                        age / 3600, cas_name, sess["temp_id"])
+        if age > 60:
+            logger.info("复用 %.1f 分钟前的还原会话: %s（临时文件 %s）",
+                        age / 60, cas_name, sess["temp_id"])
         link = self._refresh_link(sess["temp_id"])
         if not link:
             self._drop_session(cas_file_id)
@@ -653,22 +658,16 @@ class CASRestorer:
     def _take_reusable_session(self, cas_file_id, cas_name):
         """取出一个**还能放心复用**的还原会话；不能复用就地作废并返回 None。
 
-        三道前置检查，任何一道不过都丢弃会话、走全新秒传：
-          1. 会话未过 TTL（_session_valid）；
-          2. 登记的临时文件没在删除失败重试名单里 —— 139 侧已经对
-             这个实体报过异常了，不再复用（否则用户点播放要靠
-             「返回重播」来自愈），直接重新秒传；
-          3. 临时文件在云盘里真实存在（_temp_file_exists）。
+        两道前置检查，任何一道不过都丢弃会话、走全新秒传：
+          1. 会话未过 TTL（_session_valid）—— TTL 只有 90 秒，
+             窗口内的实体是刚秒传出来的，几乎不可能出状况；
+          2. 临时文件在云盘里真实存在（_temp_file_exists）。
+        （v2.1.13 时代的「删除失败名单」检查已删：删除重试从
+        文件创建至少 5 分钟后才可能发生，而会话 90 秒就过期，
+        名单命中在数学上不可能，留着的死逻辑只会误导人。）
         """
         sess = self._session_valid(cas_file_id)
         if not sess:
-            return None
-        with self._state_lock:
-            failing = sess["temp_id"] in self._delete_failures
-        if failing:
-            logger.info("会话的临时文件正在删除失败重试中，丢弃会话重新还原: %s",
-                        cas_name)
-            self._drop_session(cas_file_id)
             return None
         if not self._temp_file_exists(sess["temp_id"]):
             # 会话登记的临时文件在云盘里已经不存在（不管什么原因）：
@@ -824,17 +823,13 @@ class CASRestorer:
                         else:
                             self._delete_failures[fid] = tries
                     if give_up:
-                        # 这个实体已经处于「139 侧删不掉」的异常状态，
-                        # 不再允许任何会话复用它 —— 否则隔夜续播会
-                        # 复用一份出过状况的旧文件。作废会话后，
-                        # 下次播放走全新秒传（被证明可靠的路径），
-                        # 还原后的同名清扫还会再尝试删掉这个残骸。
-                        # 注意作废必须在 _state_lock 之外调：
-                        # _drop_session_by_temp_id 自己要拿同一把锁
-                        # （不可重入，锁内调用 = 自我死锁）。
-                        logger.error("临时文件 %s 连续 %d 次删除失败，放弃；"
-                                     "同步作废引用它的还原会话", fid, tries)
-                        self._drop_session_by_temp_id(fid)
+                        # v2.2.0：放弃就是纯放弃。会话只有 90 秒寿命，
+                        # 早就自然过期了，不需要（也不应该）在这里作废；
+                        # 残骸无害化 —— 没有任何会话会引用它，这部片子
+                        # 下次播放必然全新秒传，还原后的同名清扫还会
+                        # 再尝试删掉它。
+                        logger.error("临时文件 %s 连续 %d 次删除失败，放弃"
+                                     "（残骸将留待下次还原时清扫）", fid, tries)
                         continue
                     with self._pending_lock:
                         # 平方退避、30 分钟封顶：夜间接口抖动的恢复窗口
