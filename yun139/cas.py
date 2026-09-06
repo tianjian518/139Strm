@@ -73,9 +73,13 @@ MAX_SESSION_TTL = SESSION_TTL
 # _create_in_temp_dir），不会卡死。
 DIR_CHECK_INTERVAL = 60
 
+# 「只还原视频」时的白名单。.iso 是蓝光/DVD 原盘，也是正儿八经的
+# 视频容器（用户拿 139Strm 存原盘很常见）—— 以前漏了它，导致原盘
+# .cas 必须开「还原所有类型」才能播，一旦配置丢失就直接播不了。
 VIDEO_EXTS = (
     ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".ts", ".m2ts",
     ".wmv", ".rmvb", ".m4v", ".mpg", ".mpeg", ".3gp",
+    ".iso", ".img", ".vob",
 )
 
 MB = 1024 * 1024
