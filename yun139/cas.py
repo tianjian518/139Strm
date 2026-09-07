@@ -16,6 +16,7 @@ CAS（秒传文件）解析与还原播放。
 """
 
 import base64
+import copy
 import json
 import logging
 import os
@@ -81,6 +82,12 @@ VIDEO_EXTS = (
     ".wmv", ".rmvb", ".m4v", ".mpg", ".mpeg", ".3gp",
     ".iso", ".img", ".vob",
 )
+
+# .cas 解析结果缓存多久（秒）与最多缓存多少条
+# 取一次 .cas 要两次网络往返（下载地址 + GET 内容），缓存后换链/重播
+# 直接省掉这两次 —— 换链是 15 分钟一次，命中率很高。
+CAS_PARSE_CACHE_TTL = 6 * 3600
+CAS_PARSE_CACHE_MAX = 500
 
 MB = 1024 * 1024
 GB = 1024 * MB
@@ -254,6 +261,8 @@ class CASRestorer:
         self._sweep_lock = threading.Lock()
         # 临时目录 ID 上次确认的时间（节流，见 DIR_CHECK_INTERVAL）
         self._dir_checked_at = 0.0
+        # .cas 解析结果缓存：file_id -> (CASInfo, 时刻)，见 CAS_PARSE_CACHE_TTL
+        self._cas_cache = {}
         # 会话临时文件存在性校验的结果缓存：temp_id -> (是否存在, 时刻)。
         # 避免并发请求各自 list 一遍临时目录。
         self._exist_cache = {}
@@ -265,15 +274,33 @@ class CASRestorer:
         self.max_session_ttl = SESSION_TTL
 
     # ------------------------------------------------------------------
-    # 解析
+    # 解析（带缓存）
     # ------------------------------------------------------------------
 
     def parse(self, file_id, cas_name):
-        """下载 .cas 文件内容并解析出原始文件信息。"""
+        """下载 .cas 文件内容并解析出原始文件信息。
+
+        .cas 只有几百字节，但取它要**两次**网络往返（先取下载地址、
+        再 GET 内容），而换链/重播每次都要走一遍还原 —— 缓存解析结果
+        能直接省掉这两次往返。同一个 file_id 的 .cas 内容不会变，
+        缓存 6 小时安全（换链通常 15 分钟一次）。
+        """
+        now = time.time()
+        with self._state_lock:
+            hit = self._cas_cache.get(file_id)
+        if hit and now - hit[1] < CAS_PARSE_CACHE_TTL:
+            return copy.copy(hit[0])
         url = self.client.get_download_url(file_id)
         resp = self.client._session.get(url, timeout=self.client.timeout)
         resp.raise_for_status()
-        return decode(resp.content)
+        info = decode(resp.content)
+        with self._state_lock:
+            self._cas_cache[file_id] = (info, now)
+            if len(self._cas_cache) > CAS_PARSE_CACHE_MAX:
+                for k in sorted(self._cas_cache, key=lambda x: self._cas_cache[x][1])[
+                        :len(self._cas_cache) // 4]:
+                    self._cas_cache.pop(k, None)
+        return info
 
     # ------------------------------------------------------------------
     # 临时目录
@@ -370,18 +397,21 @@ class CASRestorer:
     def _create_by_sha256(self, dir_id, name, size, sha256):
         if len(sha256) != 64:
             raise CASError(f"SHA256 长度不正确: {len(sha256)}")
+        parts = build_part_infos(size)
+        sent = parts[:100]
         payload = {
             "contentHash": sha256,
             "contentHashAlgorithm": "SHA256",
             "contentType": "application/octet-stream",
             "parallelUpload": False,
-            "partInfos": build_part_infos(size)[:100],
+            "partInfos": sent,
             "size": size,
             "parentFileId": dir_id,
             "name": name,
             "type": "file",
             "fileRenameMode": "auto_rename",
         }
+        t0 = time.perf_counter()
         try:
             resp = self.client.personal_create(payload, use_pc_headers=True)
         except Yun139Error as exc:
@@ -394,6 +424,13 @@ class CASRestorer:
                     "请升级移动云盘会员，或只播放较小的 CAS 文件。" % (_fmt_size(size), msg)
                 ) from exc
             raise
+        took = time.perf_counter() - t0
+        if took > 2 or len(parts) > 100:
+            # 分片列表只发前 100 片：文件越大，被截掉的比例越高
+            # （>10GB 就开始截）。若秒传慢与截断有关，这条日志会给证据。
+            logger.info("秒传耗时 %.2fs（%s，分片 %d/%d%s）",
+                        took, _fmt_size(size), len(sent), len(parts),
+                        " 已截断" if len(parts) > 100 else "")
         data = resp.get("data") or {}
         if not data.get("exist") and not data.get("rapidUpload") \
                 and data.get("partInfos") is not None:
@@ -442,6 +479,7 @@ class CASRestorer:
 
         返回 (直链, 原始大小, 临时文件ID, 云端实际文件名, 原始片名)
         """
+        t0 = time.perf_counter()
         info = self.parse(cas_file_id, cas_name)
         preview_name = resolve_restore_name(cas_name, info)
 
@@ -454,11 +492,13 @@ class CASRestorer:
             raise CASError("CAS 内容缺少 sha256，无法秒传还原")
 
         temp_dir = self.ensure_temp_dir()
+        t1 = time.perf_counter()
         info.name = preview_name
         temp_name = "TEMP_%d_%05d_%s" % (
             int(time.time() * 1000), random.randint(0, 99999), preview_name
         )
         temp_id, real_name, temp_dir = self._create_in_temp_dir(temp_name, info)
+        t2 = time.perf_counter()
         logger.info("已秒传还原 %s -> %s (%s)", cas_name, real_name, temp_id)
 
         try:
@@ -470,6 +510,13 @@ class CASRestorer:
         if not link:
             self.delete_quietly(temp_id)
             raise CASError("还原成功但未能取得直链")
+        t3 = time.perf_counter()
+        total = t3 - t0
+        if total > 2:
+            # 分段耗时：点下一集「加载中」好几秒时，这条日志直接指出
+            # 是取 .cas 慢、秒传慢还是取直链慢，不用猜。
+            logger.info("还原耗时 %.2fs（.cas %.2fs / 秒传 %.2fs / 取链 %.2fs）: %s",
+                        total, t1 - t0, t2 - t1, t3 - t2, cas_name)
         # real_name 是云端实际文件名（带 TEMP_ 前缀，可能被服务端改号），
         # preview_name 是原始片名，清扫旧副本时按它来认人
         return link, info.size, temp_id, real_name, preview_name
