@@ -103,6 +103,12 @@ DEFAULT_CONFIG = {
     "cas_temp_ttl": 300,       # 还原出的临时文件保留秒数后自动删除
     "cas_allow_all_ext": False,  # False=只还原视频；True=任何后缀都还原
     "cas_temp_dir_id": "",     # 记住临时目录 ID，避免重启后重复创建
+    # ---- 播放方式 ----
+    # True=代理转发（默认）：视频流经本机中转，直链随时可换，
+    #      彻底消灭「播到一半 / 续播一直加载中」；代价是占用本机上行带宽。
+    # False=302 直连：流量不经过本机，但播放器钉死在旧直链上，
+    #      直链 15 分钟过期后只能退出重播。
+    "play_proxy": True,
 }
 
 
@@ -995,33 +1001,17 @@ def _cas_error_is_final(exc):
     return any(m in msg for m in _CAS_FATAL_MARKS)
 
 
-@app.route("/d/<path:file_id>", methods=["GET", "HEAD"])
-def direct_link(file_id):
-    """
-    Emby/播放器请求这个地址时，换取移动云盘直链并 302 跳转。
-
-    视频流直接从移动云盘 CDN 到播放器，本机只做一次跳转，不中转流量。
-    带 ?cas=文件名 时走秒传还原流程。
-    """
-    cfg = load_config()
-    if not cfg.get("authorization"):
-        return Response("尚未配置移动云盘 Authorization", status=503)
-
-    cas_name = request.args.get("cas") or ""
-    use_cas = (bool(cas_name) and is_cas_name(cas_name)
-               and cfg.get("cas_enabled", True))
+def _resolve_play_url(cfg, file_id, cas_name, use_cas):
+    """换取一条可用直链。成功返回 (url, None)，失败返回 (None, Response)。"""
     url, last_exc = None, None
-    attempts = 0
     t0 = time.time()
     for attempt in (1, 2):
-        attempts = attempt
         try:
             if attempt == 1:
                 client = get_client(cfg)
             else:
                 # 第一次失败：缓存的 client 可能 token/接入地址已失效，
                 # 丢掉缓存全新 init 再试一次；云盘接口偶发抖动也靠这一搏。
-                # 点「下一集」这种冷启动请求不该让用户「返回重播」才成功。
                 drop_client(cfg)
                 client = build_client(cfg)
                 client.init()
@@ -1037,18 +1027,124 @@ def direct_link(file_id):
             if attempt == 2:
                 break
     if url is None:
-        exc = last_exc
-        app.logger.info("直链获取失败 cas=%s file=%s 耗时=%.1fs 尝试=%d: %s",
-                        cas_name, file_id, time.time() - t0, attempts, exc)
-        return Response(f"获取直链失败: {exc}", status=502)
-
+        app.logger.info("直链获取失败 cas=%s file=%s 耗时=%.1fs: %s",
+                        cas_name, file_id, time.time() - t0, last_exc)
+        return None, Response(f"获取直链失败: {last_exc}", status=502)
     took = time.time() - t0
     if took > 2:
-        # 慢请求落日志：用户「一直加载中」时，能从日志直接看到
-        # 是哪部片子、花了多久、重试了几次
-        app.logger.info("直链获取较慢 cas=%s file=%s 耗时=%.1fs 尝试=%d",
-                        cas_name, file_id, took, attempts)
+        app.logger.info("直链获取较慢 cas=%s file=%s 耗时=%.1fs",
+                        cas_name, file_id, took)
+    return url, None
 
+
+def _invalidate_link(file_id, use_cas, cfg=None):
+    """丢掉缓存的直链，逼下一次请求换一条新的。"""
+    key = ("cas:" + file_id) if use_cas else file_id
+    with _cache_lock:
+        _link_cache.pop(key, None)
+    if use_cas and cfg is not None:
+        try:
+            get_restorer(cfg, get_client(cfg)).forget_session(file_id)
+        except Exception:
+            pass
+
+
+def _proxy_stream(file_id, cfg, cas_name, use_cas):
+    """
+    代理转发模式：视频流经本机中转（默认）。
+
+    为什么必须有它 —— 302 直连有个结构性死结：播放器 follow 302 之后就
+    **钉死在那条 URL 上**，而移动云盘直链实测只有约 15 分钟寿命。于是：
+
+      * 长视频播过 15 分钟 → 旧链过期 → 一直加载中；
+      * 暂停一阵子再续播 → 旧链过期、临时文件已被清理 → 一直加载中。
+
+    这两种情况下播放器都**不会**再回来问服务端要新链，服务端连补救窗口
+    都没有，只能等用户「退出重播」。
+
+    代理模式下播放器始终连本机地址，每一个 Range 请求都由服务端当场取一条
+    有效的直链转发，于是：
+      * 直链过期 → 下一次 Range 请求自动换新链，播放不中断；
+      * 续播时临时文件已删 → 当场重新秒传还原（幂等，1~2 秒），不必退出重播。
+
+    代价是流量经过本机（内网播放无感；外网播放会占用本机上行带宽），
+    所以系统设置里可以切回 302 直连。
+    """
+    import requests as _rq
+
+    url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas)
+    if url is None:
+        return err
+
+    def _open(u, rng):
+        headers = {"Range": rng} if rng else {}
+        return _rq.get(u, headers=headers, stream=True, timeout=(15, 60))
+
+    # HEAD 不带上 Range：让上游返回 200 + 完整 Content-Length 给播放器探测用
+    rng = request.headers.get("Range") if request.method != "HEAD" else None
+    up = _open(url, rng)
+
+    if up.status_code >= 400:
+        # 上游拒绝（直链过期 / 临时文件已被清）——这正是代理模式的价值所在：
+        # 现在就能换一条新链，而不是让用户「返回重播」。
+        app.logger.info("代理转发上游返回 %d，换新链重试 cas=%s file=%s",
+                        up.status_code, cas_name, file_id)
+        up.close()
+        _invalidate_link(file_id, use_cas, cfg)
+        url2, err2 = _resolve_play_url(cfg, file_id, cas_name, use_cas)
+        if url2 is None:
+            return err2
+        up = _open(url2, rng)
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": up.headers.get("Content-Type") or "video/mp4",
+        "Cache-Control": "no-store",
+    }
+    for h in ("Content-Length", "Content-Range", "ETag", "Last-Modified"):
+        if h in up.headers:
+            headers[h] = up.headers[h]
+    status = up.status_code
+
+    if request.method == "HEAD":
+        up.close()
+        return Response(status=status, headers=headers)
+
+    def _gen():
+        try:
+            for chunk in up.iter_content(chunk_size=65536):
+                if chunk:
+                    yield chunk
+        finally:
+            up.close()
+
+    return Response(_gen(), status=status, headers=headers)
+
+
+@app.route("/d/<path:file_id>", methods=["GET", "HEAD"])
+def direct_link(file_id):
+    """
+    Emby/播放器请求这个地址时，换取移动云盘直链并 302 跳转。
+
+    视频流直接从移动云盘 CDN 到播放器，本机只做一次跳转，不中转流量。
+    带 ?cas=文件名 时走秒传还原流程。
+    """
+    cfg = load_config()
+    if not cfg.get("authorization"):
+        return Response("尚未配置移动云盘 Authorization", status=503)
+
+    cas_name = request.args.get("cas") or ""
+    use_cas = (bool(cas_name) and is_cas_name(cas_name)
+               and cfg.get("cas_enabled", True))
+    # 代理模式（默认）：流量经本机转发，直链随时可换，
+    # 彻底消灭「播到一半 / 续播一直加载中」。
+    # ?direct=1 可临时退回直连，系统设置里也能整体关掉。
+    if cfg.get("play_proxy", True) and not request.args.get("direct"):
+        return _proxy_stream(file_id, cfg, cas_name, use_cas)
+
+    url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas)
+    if url is None:
+        return err
     resp = redirect(url, code=302)
     resp.headers["Cache-Control"] = "no-store"
     return resp
