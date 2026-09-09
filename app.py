@@ -43,9 +43,27 @@ CAS_LINK_MAX_TTL = 15 * 60
 CAS_TEMP_GRACE = 120
 # 缓存期内多久探一次直链是否还活着（秒）。设这个是为了接住「用户手动清空了
 # 临时目录」这类情况：不探的话缓存没到期，播放器会一直拿到指向已删文件的死链。
-# 节流 + 只有明确 4xx 才判失效，所以不会因为 CDN 不支持探测而反复还原。
+# 节流 + 只有「明确 4xx」或「连续两次说不清」才判失效，所以不会因为
+# CDN 不支持探测、探测偶尔超时就反复还原（v2.1.8 修过的老毛病）。
 CAS_PROBE_INTERVAL = 60
 _probe_at = {}
+# 「说不清」名单：某条链上一次探测拿到了 200 却没交待任何长度信息。
+# 一次可能是 CDN 正在给刚还原的文件回源，连续两次才敢判死。
+_probe_suspect = {}
+# 直链交到播放器之前先自己拉 1 个字节验一次，超时就当没探成（不重试）。
+# 用比常规探测更短的超时，别让校验本身把「点下一集」拖慢。
+CAS_LINK_VERIFY_TIMEOUT = 3
+# 「删掉重还原」的补救多久之内不重复做（秒）。万一 CDN 压根不接受 Range
+# 探测（每条链都回 4xx），没有这个冷却就会每次换链都白搭一次秒传，
+# 换集直接慢一倍 —— 真遇到这种情况，认赔一次比一直赔划算。
+CAS_VERIFY_RETRY_COOLDOWN = 600
+_verify_retried = {}
+
+# 一次 Range 探测的结论
+PROBE_ALIVE = "alive"       # 老实给了字节/长度信息
+PROBE_DEAD = "dead"         # 明确 4xx —— 这条链已经废了
+PROBE_VAGUE = "vague"       # 应答拿到了，可 200 却没交待长度 —— 说不清
+PROBE_UNKNOWN = "unknown"   # 探测自己没探成（超时 / 异常 / 5xx / 3xx）
 
 # 后台生成任务（队列式：可串行执行多个任务）
 _task_state = {
@@ -780,49 +798,101 @@ def _link_expire(url, default_ttl, max_ttl=None):
     return fallback
 
 
+def _probe_link(url, timeout=5):
+    """
+    对直链发一次 Range: bytes=0-0，看它还活不活。
+
+    只取 1 个字节，且用 stream 避免把整个视频拉回来。
+
+    「探测自己没探成」（超时、网络异常、5xx、3xx）和「应答拿到了却说不清」
+    是两回事，必须分开：前者是探测侧的问题，一律判活（v2.1.8 的血泪 ——
+    让探测抖动演变成「来一个请求就还原一份」是最糟糕的回归）；后者才需要
+    再确认一次。
+    """
+    try:
+        import requests
+        resp = requests.get(url, headers={"Range": "bytes=0-0"},
+                            timeout=timeout, stream=True)
+    except Exception:
+        return PROBE_UNKNOWN
+    code = resp.status_code
+    if 400 <= code < 500:
+        resp.close()
+        return PROBE_DEAD
+    if 200 <= code < 300:
+        length = (resp.headers.get("Content-Length") or "").strip()
+        content_range = (resp.headers.get("Content-Range") or "").strip()
+        chunked = "chunked" in (resp.headers.get("Transfer-Encoding")
+                                or "").lower()
+        resp.close()
+        if code == 206:
+            return PROBE_ALIVE          # 老老实实给了 1 个字节
+        if chunked:
+            return PROBE_ALIVE          # chunked 编码没有 Content-Length 是正常的
+        if content_range or length not in ("", "0"):
+            return PROBE_ALIVE          # 200 但诚实交待了总长度
+        # 200 却没有任何长度信息：要么 CDN 正在给刚还原的文件回源（正常），
+        # 要么是在对一个已经废掉的文件敷衍（v2.1.13 抓的假活）→ 说不清
+        return PROBE_VAGUE
+    resp.close()
+    return PROBE_UNKNOWN                # 3xx / 5xx：探测没探成
+
+
 def _cas_link_dead(key, url):
     """
     缓存里的直链是不是已经废了（节流探测，同一个片子最多 60 秒探一次）。
 
-    只在**明确拿到 4xx** 时才判死 —— 网络异常、超时、5xx 一律当作还活着，
-    绝不能让探测抖动变成「不停重新秒传还原」。
-    额外判死一类「假活」：Range 请求要 1 个字节，正常应答是 206 或
-    带非零 Content-Length 的 200；如果返回 200 却没有长度或长度为 0，
-    说明 CDN 在对一个坏文件敷衍 —— 也判死，别让播放器去转圈。
+    4xx 一次就判死 —— 那是明确信号，别让播放器对着死链转圈。
+    「200 却没长度」要**连续两次**才判死：CDN 给刚还原的文件回源时就是这副
+    样子，一次说明不了问题；但回源不会拖过 60 秒，第二次还是这样，基本
+    可以断定这条链废了（v2.1.13 的假活照样抓得住，只是不再冤枉回源中的好链）。
+    探测自己没探成的一律判活。
     """
     now = time.time()
     if now - _probe_at.get(key, 0) < CAS_PROBE_INTERVAL:
         return False
     _probe_at[key] = now
-    try:
-        import requests
-        # 只取 1 个字节，且用 stream 避免把整个视频拉回来
-        resp = requests.get(url, headers={"Range": "bytes=0-0"},
-                            timeout=5, stream=True)
-        code = resp.status_code
-        if 400 <= code < 500:
-            resp.close()
-            return True
-        if 200 <= code < 300:
-            length = (resp.headers.get("Content-Length") or "").strip()
-            content_range = (resp.headers.get("Content-Range") or "").strip()
-            chunked = "chunked" in (resp.headers.get("Transfer-Encoding")
-                                    or "").lower()
-            resp.close()
-            if code == 206:
-                return False          # 206：老老实实给了 1 字节 → 活
-            if chunked:
-                return False          # chunked 编码没有 Content-Length 是正常的
-            # 200：要么带非零总长度，要么就是敷衍
-            if length not in ("", "0"):
-                return False
-            if content_range:
-                return False          # 200 + Content-Range 也算诚实应答
-            return True               # 200 但无任何长度信息 → 假活，判死
-        resp.close()
-    except Exception:
-        return False          # 探不到就不敢断定，继续用
-    return False              # 5xx 等：一律保守判活，不让探测抖动引发反复秒传
+    verdict = _probe_link(url)
+    if verdict == PROBE_DEAD:
+        _probe_suspect.pop(key, None)
+        return True
+    if verdict == PROBE_VAGUE:
+        if _probe_suspect.pop(key, None):
+            return True                 # 连续两次说不清 → 判死
+        if len(_probe_suspect) > 500:
+            _probe_suspect.clear()
+        _probe_suspect[key] = now
+        return False
+    _probe_suspect.pop(key, None)
+    return False                        # 活着，或者压根没探成
+
+
+def _fresh_link_broken(key, url):
+    """
+    刚签发的直链是不是根本用不了 —— 连续两次 4xx 才算。
+
+    为什么非要在交出去之前验一次：播放器 follow 302 之后就**钉死在这条
+    URL 上**了，服务端后面再怎么重建、换链它都不知道，只能等用户退出去
+    重播 —— 那就是「偶尔一直加载中」的全部成因。
+
+    连验两遍不是强迫症：CDN 边缘节点对刚秒传出来的文件常常要第一次请求
+    才触发回源，第一遍 4xx、第二遍就好了，而且这一探等于替播放器把回源
+    趟了一遍；真废了的链才会两遍都 4xx。
+    """
+    _probe_at[key] = time.time()        # 刚探过，60 秒内别再重复探它
+    return (_probe_link(url, CAS_LINK_VERIFY_TIMEOUT) == PROBE_DEAD
+            and _probe_link(url, CAS_LINK_VERIFY_TIMEOUT) == PROBE_DEAD)
+
+
+def _verify_retry_allowed(key):
+    """补救机会还有没有（见 CAS_VERIFY_RETRY_COOLDOWN）。"""
+    now = time.time()
+    if now - _verify_retried.get(key, 0) < CAS_VERIFY_RETRY_COOLDOWN:
+        return False
+    if len(_verify_retried) > 500:
+        _verify_retried.clear()
+    _verify_retried[key] = now
+    return True
 
 
 def _cache_put(key, value):
@@ -862,7 +932,10 @@ def _get_cas_link(client, cfg, file_id, cas_name):
       * 复用只发生在 90 秒幂等窗口内（探测后播放、并发请求、
         直链假活后的换链重建），见 cas.SESSION_TTL；
       * 临时文件的删除时间跟着缓存走（缓存失效后再留 CAS_TEMP_GRACE 秒），
-        文件永远活过直链，不依赖「删除不影响已签发直链」这类云盘行为。
+        文件永远活过直链，不依赖「删除不影响已签发直链」这类云盘行为；
+      * 直链交给播放器之前会自己先拉 1 个字节验一次，连续 4xx 就删掉重来
+        （只重来一次）—— 播放器 follow 302 之后就钉死在那条 URL 上，
+        这是唯一的补救窗口，错过就只能等用户「返回重播」。
     """
     now = time.time()
     key = "cas:" + file_id
@@ -885,13 +958,15 @@ def _get_cas_link(client, cfg, file_id, cas_name):
         app.logger.info("缓存的直链已失效（%s），重新还原", cas_name)
 
     url, size, temp_id, real_name, restored = restorer.fetch_link(file_id, cas_name)
-    if not restored and _cas_link_dead(key, url):
-        # 复用的旧会话可能指向已经不在了的临时文件（隔天续播、
-        # 用户在云盘里手动删了临时文件等）。取直链接口对不存在的文件
-        # 照样签发 URL —— 不探一下就会把死链发给播放器，表现是
-        # 「隔天继续播放一直加载中，返回重播才正常」。
+    # 注意 and 的短路：只有确实探到坏链才会消耗掉那一次补救机会
+    if _fresh_link_broken(key, url) and _verify_retry_allowed(key):
+        # 这条链根本用不了：新还原的文件在 CDN 侧还没同步，或者复用的实体
+        # 其实已经不在了（取直链接口对不存在的文件照样签发 URL，不探一下
+        # 就会把死链发给播放器 —— 表现是「一直加载中，返回重播才正常」）。
+        # 播放器 follow 302 后就钉在这条 URL 上了，所以必须现在就补救。
+        app.logger.warning("刚取到的直链不可用（%s），删掉重还原一次", cas_name)
+        restorer.delete_quietly(temp_id)
         restorer.forget_session(file_id)
-        app.logger.info("复用的临时直链已失效（%s），强制重新还原", cas_name)
         url, size, temp_id, real_name, restored = restorer.fetch_link(
             file_id, cas_name)
     expire = _link_expire(url, LINK_TTL, CAS_LINK_MAX_TTL)
