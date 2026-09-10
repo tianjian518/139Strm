@@ -53,7 +53,7 @@ CAS_LINK_MAX_TTL = 4 * 60
 CAS_TEMP_GRACE = 120
 # 缓存里的直链多久探一次（秒）。
 #
-# 【v2.2.13】v2.2.9 曾把它废成 0（每次请求都探），理由是「这 60 秒里链坏了
+# 【v2.2.14】v2.2.9 曾把它废成 0（每次请求都探），理由是「这 60 秒里链坏了
 # 照样往外发」。用户的甲骨文诊断数据推翻了那个决定：热路径上只剩探测一步
 # 却要 4.8 秒 —— 说明**在海外服务器上探测本身很贵**。每次播放都白等几秒，
 # 代价远超它防住的那点风险。恢复 60 秒节流（这也是 v2.2.2 生产验证过的值）。
@@ -88,7 +88,7 @@ PLAY_REQUEST_DEADLINE = 25
 # ----------------------------------------------------------------------
 # 探测熔断：防止「探不到 → 判链死刑 → 重建」演变成还原风暴
 # ----------------------------------------------------------------------
-# 【v2.2.13 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
+# 【v2.2.14 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
 #
 # 事情是这样的：交链前探测直链，是 v2.2.3 才加进来的。v2.2.2 及以前
 # 交链前**完全不探测**，而那一版在生产上跑了很久、从没出过问题。
@@ -248,7 +248,7 @@ _clients = {}
 _clients_lock = threading.Lock()
 # 建 client（含 init 的两次接口往返）单独串行。
 #
-# 【v2.2.13】以前 init 在锁外调用，浏览器并发发两条播放请求时，
+# 【v2.2.14】以前 init 在锁外调用，浏览器并发发两条播放请求时，
 # **两边都会各 init 一遍** —— 白扔两次跨国际线路的往返。用户诊断里
 # 那两条重叠的请求（9.5 秒 + 4.8 秒）就有这个成分：第二条进来时
 # 第一条还在建连接，于是它也建了一遍。
@@ -848,7 +848,7 @@ def api_strm_status():
 def _amz_deadline(url):
     """从预签名直链里读出**真正的**过期时刻（unix 秒）；读不到返回 None。
 
-    实测（v2.2.13）：139 给的是对象存储的预签名 URL，形如
+    实测（v2.2.14）：139 给的是对象存储的预签名 URL，形如
         https://<bucket>.eos.<region>.cmecloud.cn/<obj>
             ?X-Amz-Algorithm=AWS4-HMAC-SHA256
             &X-Amz-Date=20260910T012236Z      ← 签发时刻（UTC）
@@ -874,7 +874,7 @@ def _amz_deadline(url):
 def _link_expire(url, default_ttl, max_ttl=None):
     """按直链自己的过期时间来决定缓存多久。
 
-    【v2.2.13 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
+    【v2.2.14 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
     「t 是过期时间戳」。实际上 `t` 恒等于 2 —— 那是个标志位，不是
     时间戳。于是 `now - 86400 < 2 < now + 86400` 永远不成立，判断
     永远落空，**永远走兜底值**。连带后果是诊断页里显示的「直链余命」
@@ -974,7 +974,7 @@ def _probe_status():
 
 # 探测专用连接池。
 #
-# 【v2.2.13 关键优化】以前探测用的是 requests.get()，**每次都新建一条连接** ——
+# 【v2.2.14 关键优化】以前探测用的是 requests.get()，**每次都新建一条连接** ——
 # 新建连接要 TCP 握手 + TLS 握手，一共 3 个来回。本地感觉不到（一个来回
 # 0.5 毫秒），但服务器在海外、一个来回几百毫秒到一两秒时，光是"重新握手"
 # 就要好几秒 —— 而这笔钱每次探测都要重付一遍。
@@ -1075,7 +1075,7 @@ def _cas_link_dead(key, url):
     """
     缓存里的这条直链**现在**还能不能真的取到数据。
 
-    【v2.2.13 —— 数据驱动的回退】
+    【v2.2.14 —— 数据驱动的回退】
     v2.2.9 我把这里的「60 秒节流」去掉了，理由是「这 60 秒窗口里链坏了
     照样往外发」。当时我以为探测很便宜（本地实测 0.2 秒）。
     用户从甲骨文发回来的诊断数据推翻了这个前提：
@@ -1124,7 +1124,7 @@ def _fresh_link_broken(key, url, cas_name=""):
     """
     刚签发的直链是不是根本用不了。
 
-    【v2.2.13 更正 —— 这是整场排查的落点】
+    【v2.2.14 更正 —— 这是整场排查的落点】
     这里以前是无条件相信探测结果：探不到就删掉重还原。在海外服务器上
     这是个灾难 —— 服务器跨国际线路去看国内 CDN，探测经常探不到，
     于是一个播放请求就删文件、重还原一份，播放器一路转圈。
@@ -1203,22 +1203,40 @@ def _mark_served(file_id):
             _last_served[file_id] = time.time()
 
 
-def _is_resume(file_id):
+def _is_resume(file_id, gap=None):
     """这次请求是不是「播到一半退出去、过了一阵子回来接着播」。
 
-    判据两条，缺一不可：
-      1. 播放器带了一个**非零起点**的 Range —— 说明它要接着上次的进度；
-      2. 这个片子已经有一阵子没人来要链了 —— 说明不是播放过程中的 seek。
+    【v2.2.14 —— 用户实测纠正】
+    以前这里是「Range 起点必须大于 0」**且**「距上次交链超过 180 秒」，
+    两个条件都要满足。用户拿真实数据证明这个判据是坏的：
 
-    第 2 条很关键：播放中拖动进度条也会带非零 Range，但那是「几秒前
-    刚来要过链」的连续播放，绝不能当成续播去重新秒传 —— 那正是
-    v2.1.x「一分钟还原七八次」的老病根。
+        10:53:58  第134集  耗时 2424ms  距上次 648 秒   ← 明明是续播
+        10:54:25  02 4K    耗时 1934ms  距上次 250 秒   ← 明明是续播
+
+    服务端却把这两条全判成了「新播」。两个原因：
+
+      1. **浏览器播 HTML5 视频，续播的第一条请求是"从头"的**
+         （Range=(无) 或 bytes=0-0，起点都是 0），带偏移的真身跟在
+         后面。只认 Range 的话，这第一条立刻被判成「新播」；
+      2. 就算真身带了偏移，也过不了第二关 —— 因为**第一条探测请求
+         2 秒前刚更新过「上次交链时刻」**，算出来是「2 秒前」，
+         于是被当成「播放中拖进度条」。
+
+    两条判据互相打架，结果是续播**永远走不到**「丢弃旧状态」那条路上，
+    一直复用旧链 —— 而旧链正是所有「一直加载中」的温床。
+
+    【判据：只看时间间隔】
+    Range 长什么样是**误导**：续播时浏览器发的第一条不带偏移，而播放中
+    拖进度条却带偏移 —— 拿 Range 当判据，两个方向都会判错。
+    真正区分「续播」和「拖进度条」的只有一件事：**多久没人来要过链**。
+      * 拖进度条：几秒前刚来过（连续播放中）；
+      * 续播：几十分钟、几小时、隔夜（停过一阵子）。
+
+    所以现在只看 gap（距上次访问的秒数，由调用方在更新记录**之前**算好）。
+    误判的代价只是「多花一两秒重新秒传一次」；而且因为记录会被立刻更新，
+    同一个片子最快也只能每 RESUME_IDLE_GAP 秒重来一次，不会变成还原风暴。
     """
-    if _range_start() <= 0:
-        return False
-    with _last_served_lock:
-        last = _last_served.get(file_id, 0)
-    return (time.time() - last) > RESUME_IDLE_GAP
+    return gap is not None and gap > RESUME_IDLE_GAP
 
 
 def _get_link(client, file_id, resume=False):
@@ -1387,6 +1405,26 @@ def _cas_error_is_final(exc):
     return any(m in msg for m in _CAS_FATAL_MARKS)
 
 
+def _friendly_error(exc):
+    """把底层异常翻译成一句人能看懂的话，交给播放器显示。
+
+    以前是把原始异常原样抛出去，用户看到的是
+        「获取直链失败: 502 Server Error: Bad Gateway for url: https://...」
+    —— 又长又吓人，还不知道该怎么办。移动云盘的接口偶尔会返回 502/超时，
+    这种情况**重试一下通常就好**，所以直接把话说清楚。
+    """
+    msg = str(exc)
+    low = msg.lower()
+    if "bad gateway" in low or "502" in msg or "503" in msg:
+        return "获取直链失败：移动云盘接口暂时不可用（502/503）。请稍等几秒重试。"
+    if "timed out" in low or "timeout" in low or "超过本次播放的等待上限" in msg:
+        return ("获取直链失败：移动云盘接口响应太慢，已超过本次等待上限。"
+                "请重试（重试会快很多）。")
+    if "connection" in low or "max retries" in low:
+        return "获取直链失败：连不上移动云盘。请检查服务器网络后重试。"
+    return f"获取直链失败: {msg[:200]}"
+
+
 def _resolve_play_url(cfg, file_id, cas_name, use_cas, resume=False):
     """换取一条可用直链。成功返回 (url, None)，失败返回 (None, Response)。"""
     url, last_exc = None, None
@@ -1415,7 +1453,7 @@ def _resolve_play_url(cfg, file_id, cas_name, use_cas, resume=False):
     if url is None:
         app.logger.info("直链获取失败 cas=%s file=%s 耗时=%.1fs: %s",
                         cas_name, file_id, time.time() - t0, last_exc)
-        return None, Response(f"获取直链失败: {last_exc}", status=502)
+        return None, Response(_friendly_error(last_exc), status=502)
     took = time.time() - t0
     if took > 2:
         app.logger.info("直链获取较慢 cas=%s file=%s 耗时=%.1fs",
@@ -1458,7 +1496,11 @@ def _proxy_stream(file_id, cfg, cas_name, use_cas):
     """
     import requests as _rq
 
-    resume = _is_resume(file_id)
+    with _last_seen_lock:
+        _prev = _last_seen.get(file_id)
+        gap = int(time.time() - _prev) if _prev else 0
+        _last_seen[file_id] = time.time()
+    resume = _is_resume(file_id, gap)
     set_request_deadline(PLAY_REQUEST_DEADLINE)
     try:
         url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas, resume)
@@ -1549,7 +1591,7 @@ def direct_link(file_id):
         if len(_last_seen) > 2000:
             _last_seen.clear()
             _last_seen[file_id] = time.time()
-    resume = _is_resume(file_id)
+    resume = _is_resume(file_id, gap)
     # 给这次请求套一个总时限：再慢也不会「加载到天荒地老」，
     # 最坏是等一会儿快速失败，用户重试时状态已热、秒开。
     set_request_deadline(PLAY_REQUEST_DEADLINE)
