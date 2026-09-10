@@ -304,7 +304,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
 
       <div class="card">
         <div class="card-title">🩺 播放诊断 <span class="sub">最近 40 次播放请求</span></div>
-        <div class="hint">偶发「一直加载中」时，先看这里：<b>红色=服务端没能给出直链</b>（会写明原因）；绿色的「直链余命」是交出去时这条链还剩多少秒可用。把红色的那条内容发给我，就能精准定位。</div>
+        <div class="hint">偶发「一直加载中」时，先看这里：<b>红色=服务端没能给出直链</b>（会写明原因）；绿色的「直链余命」是交出去时这条链还剩多少秒可用。<b>🔁续播</b> 表示这次被识别成「接着上次进度回来」，服务端已按全新播放重来（丢弃旧直链和旧秒传会话）；<b>🆕新播</b> 表示从头播。</div>
         <div id="diagBox" style="margin-top:8px;font-size:12px;line-height:1.9;max-height:240px;overflow:auto">加载中…</div>
         <div style="display:flex;gap:8px;margin-top:8px">
           <button class="btn sec" onclick="loadDiag()">刷新</button>
@@ -684,12 +684,19 @@ async function loadDiag(){
   if (!j.ok || !j.items || !j.items.length){ box.innerHTML='<div style="opacity:.6">暂无播放记录</div>'; return }
   box.innerHTML = j.items.map(it=>{
     const color = it.ok ? '#16a34a' : '#dc2626'
+    // 续播标记：一眼看出这次请求服务端有没有按「全新播放」重来。
+    // 续播（播放器带着非零起点回来、且这部片子已经有一阵子没被访问）
+    // 是唯一会「一直加载中」的那条路，必须能一眼认出来。
+    const tag = it.resume
+      ? '<b style="color:#2563eb">🔁续播</b> '
+      : '<span style="opacity:.55">🆕新播</span> '
     const info = it.ok
       ? `耗时 ${it.ms}ms · 直链余命 ${it.life}s${it.cas?' · CAS秒传':''}`
       : `❌ ${(it.err||'未知原因').replace(/</g,'&lt;')}`
     return `<div style="padding:3px 0;border-bottom:1px solid rgba(128,128,128,.15)">
       <span style="color:${color}">●</span> ${it.t}
-      · <b>${(it.name||'').replace(/</g,'&lt;').slice(0,26)}</b>
+      · ${tag}
+      <b>${(it.name||'').replace(/</g,'&lt;').slice(0,26)}</b>
       <span style="opacity:.75">${info}</span></div>`
   }).join('')
 }

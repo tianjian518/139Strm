@@ -11,6 +11,7 @@
 import collections
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -49,11 +50,12 @@ LINK_TTL = 2 * 3600  # 直链有时效，缓存 2 小时
 CAS_LINK_MAX_TTL = 4 * 60
 # 直链缓存失效后，临时文件再多留一会儿（防止最后一波 Range 请求打空）
 CAS_TEMP_GRACE = 120
-# 缓存期内多久探一次直链是否还活着（秒）。设这个是为了接住「用户手动清空了
-# 临时目录」这类情况：不探的话缓存没到期，播放器会一直拿到指向已删文件的死链。
-# 节流 + 只有「明确 4xx」或「连续两次说不清」才判失效，所以不会因为
-# CDN 不支持探测、探测偶尔超时就反复还原（v2.1.8 修过的老毛病）。
-CAS_PROBE_INTERVAL = 60
+# 【v2.2.7 已废除】CAS_PROBE_INTERVAL 曾经是「缓存期内最多 60 秒探一次」的
+# 节流。实测下来这个节流得不偿失：省下的那点探测开销，代价是这 60 秒窗口里
+# 链坏了照样往外发，而 302 直连下播放器一旦拿到链就钉死、服务端事后无法补救。
+# 现在改成**每次交链都真探**，一次只要 0.2 秒。留着这个名字只为让老配置和
+# 外部脚本不至于报错，代码里不再使用。
+CAS_PROBE_INTERVAL = 0
 _probe_at = {}
 # 「说不清」名单：某条链上一次探测拿到了 200 却没交待任何长度信息。
 # 一次可能是 CDN 正在给刚还原的文件回源，连续两次才敢判死。
@@ -65,8 +67,22 @@ _probe_suspect = {}
 # 而用户「返回播放」时回源正好完成，于是秒开 —— 这就是那个
 # 「时好时坏、什么间隔都可能撞上」的偶发问题。
 # 宁可开播慢两三秒，也别把一条还没就绪的链交给播放器。
-CAS_LINK_VERIFY_TIMEOUT = 4      # 单次探测超时（秒）
+CAS_LINK_VERIFY_TIMEOUT = 4      # 第一次探测超时（秒）
+CAS_LINK_VERIFY_RETRY_TIMEOUT = 2  # 复探超时（秒）—— 短一些，别让用户干等
 CAS_VERIFY_BACKOFF = 1.2         # 探不清时退避多久再探一次
+
+# ----------------------------------------------------------------------
+# 探测熔断：防止「探不到 → 判链死刑 → 重建」演变成还原风暴
+# ----------------------------------------------------------------------
+# 场景：服务器到 CDN 的路突然不通（Oracle Cloud 到国内 CDN 偶尔会这样）。
+# 这时候每一次探测都是超时 —— 但那不代表**链坏了**，只代表**我们探不到**。
+# 如果照着「探不到就重建」办，播放器每来一次请求就秒传还原一份，
+# 一分钟能还原七八次、临时目录堆几十 GB（v2.1.8 真实踩过的坑）。
+# 所以：连续多次「根本没探成」就熔断，熔断期内不再因为探不到而判链死刑。
+PROBE_BREAKER_THRESHOLD = 8      # 连续这么多次「探不成」就熔断
+PROBE_BREAKER_SECONDS = 300      # 熔断持续多久
+_probe_fail_streak = 0
+_probe_fail_until = 0
 # 「删掉重还原」的补救多久之内不重复做（秒）。万一 CDN 压根不接受 Range
 # 探测（每条链都回 4xx），没有这个冷却就会每次换链都白搭一次秒传，
 # 换集直接慢一倍 —— 真遇到这种情况，认赔一次比一直赔划算。
@@ -786,21 +802,58 @@ def api_strm_status():
 # 302 直链端点（核心）
 # ----------------------------------------------------------------------
 
+def _amz_deadline(url):
+    """从预签名直链里读出**真正的**过期时刻（unix 秒）；读不到返回 None。
+
+    实测（v2.2.7）：139 给的是对象存储的预签名 URL，形如
+        https://<bucket>.eos.<region>.cmecloud.cn/<obj>
+            ?X-Amz-Algorithm=AWS4-HMAC-SHA256
+            &X-Amz-Date=20260910T012236Z      ← 签发时刻（UTC）
+            &X-Amz-Expires=900                 ← 有效期秒数
+            &X-Amz-Signature=...
+    过期时刻 = X-Amz-Date + X-Amz-Expires，实测稳定 900 秒。
+    """
+    try:
+        from urllib.parse import urlparse, parse_qs
+        import calendar
+        q = parse_qs(urlparse(url).query)
+        date_s = (q.get("X-Amz-Date") or [""])[0]
+        exp_s = (q.get("X-Amz-Expires") or [""])[0]
+        if date_s and exp_s:
+            signed_at = calendar.timegm(
+                time.strptime(date_s, "%Y%m%dT%H%M%SZ"))
+            return signed_at + int(exp_s)
+    except Exception:
+        pass
+    return None
+
+
 def _link_expire(url, default_ttl, max_ttl=None):
     """按直链自己的过期时间来决定缓存多久。
 
-    移动云盘的直链带 t= 过期时间戳，实测只有约 15 分钟。
-    以前一律缓存 2 小时，结果直链早过期了缓存还有效 —— 表现就是
-    「播过的视频，过一会儿再播就一直加载」。
-    这里直接读 t，留 60 秒余量；读不到才退回默认时长。
+    【v2.2.7 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
+    「t 是过期时间戳」。实际上 `t` 恒等于 2 —— 那是个标志位，不是
+    时间戳。于是 `now - 86400 < 2 < now + 86400` 永远不成立，判断
+    永远落空，**永远走兜底值**。连带后果是诊断页里显示的「直链余命」
+    也永远是那个兜底数字（239 秒），等于一直是瞎的。
 
-    t 有可能是毫秒时间戳（那会被当成 5 万年后的过期时间，
-    缓存永不失效），所以要先做量级校验，超出合理区间就退回默认值。
+    现在改成读预签名 URL 里真正的寿命（X-Amz-Date + X-Amz-Expires），
+    并保留原来的 t 逻辑作为兼容分支。
     """
     now = time.time()
     fallback = now + default_ttl
     if max_ttl:
         fallback = min(fallback, now + max_ttl)
+
+    # 1) 预签名 URL：读真正的过期时刻
+    deadline = _amz_deadline(url)
+    if deadline and now - 86400 < deadline < now + 86400:
+        expire = deadline - 60          # 留 60 秒余量，不把「快死的链」交出去
+        if max_ttl:
+            expire = min(expire, now + max_ttl)
+        return max(expire, now + 15)
+
+    # 2) 兼容老式带 t= 时间戳的直链
     try:
         from urllib.parse import urlparse, parse_qs
         t = int(parse_qs(urlparse(url).query).get("t", ["0"])[0])
@@ -812,12 +865,33 @@ def _link_expire(url, default_ttl, max_ttl=None):
                 expire = t - 60
                 if max_ttl:
                     expire = min(expire, now + max_ttl)
-                # 直链已经（快）过期时也要至少缓存十几秒，否则每次请求都会
-                # 重新换链，播放器一密集请求就把接口打爆了
                 return max(expire, now + 15)
     except Exception:
         pass
     return fallback
+
+
+def _note_probe_fail():
+    """探测「根本没探成」（超时/网络异常）记一笔；连续太多次就熔断。"""
+    global _probe_fail_streak, _probe_fail_until
+    _probe_fail_streak += 1
+    if _probe_fail_streak >= PROBE_BREAKER_THRESHOLD:
+        _probe_fail_until = time.time() + PROBE_BREAKER_SECONDS
+        _probe_fail_streak = 0
+        app.logger.warning(
+            "连续 %d 次探测都没探成，判定为「探测不可用」并熔断 %d 秒 —— "
+            "这段时间内不再因为探不到而判链死刑",
+            PROBE_BREAKER_THRESHOLD, PROBE_BREAKER_SECONDS)
+
+
+def _note_probe_ok():
+    global _probe_fail_streak
+    _probe_fail_streak = 0
+
+
+def _probe_usable():
+    """探测这件事本身还靠不靠得住（熔断器没跳闸）。"""
+    return time.time() >= _probe_fail_until
 
 
 def _probe_link(url, timeout=5):
@@ -826,17 +900,18 @@ def _probe_link(url, timeout=5):
 
     只取 1 个字节，且用 stream 避免把整个视频拉回来。
 
-    「探测自己没探成」（超时、网络异常、5xx、3xx）和「应答拿到了却说不清」
-    是两回事，必须分开：前者是探测侧的问题，一律判活（v2.1.8 的血泪 ——
-    让探测抖动演变成「来一个请求就还原一份」是最糟糕的回归）；后者才需要
-    再确认一次。
+    「探测自己没探成」（超时、网络异常）和「应答拿到了却说不清」
+    是两回事，必须分开：前者是**探测侧**的问题（服务器到 CDN 的路不通），
+    后者才是**链侧**的问题。这个区分是防还原风暴的关键。
     """
     try:
         import requests
         resp = requests.get(url, headers={"Range": "bytes=0-0"},
                             timeout=timeout, stream=True)
     except Exception:
+        _note_probe_fail()
         return PROBE_UNKNOWN
+    _note_probe_ok()
     code = resp.status_code
     if 400 <= code < 500:
         resp.close()
@@ -862,53 +937,63 @@ def _probe_link(url, timeout=5):
 
 def _cas_link_dead(key, url):
     """
-    缓存里的直链是不是已经废了（节流探测，同一个片子最多 60 秒探一次）。
+    缓存里的这条直链**现在**还能不能真的取到数据。
 
-    4xx 一次就判死 —— 那是明确信号，别让播放器对着死链转圈。
-    「200 却没长度」要**连续两次**才判死：CDN 给刚还原的文件回源时就是这副
-    样子，一次说明不了问题；但回源不会拖过 60 秒，第二次还是这样，基本
-    可以断定这条链废了（v2.1.13 的假活照样抓得住，只是不再冤枉回源中的好链）。
-    探测自己没探成的一律判活。
+    【v2.2.7 重要更正】以前这里有两个要命的设计：
+      1. 60 秒节流：同一个片子最多 60 秒探一次。省下的那点时间，
+         代价是这 60 秒窗口里链坏了照样往外发 —— 302 直连下播放器
+         一旦拿到链就钉死，服务端事后无法补救。
+      2. 「探不清就判活」：探测超时/5xx/3xx 一律当活链交出去。
+         可「探不清」恰恰就是播放器**一直转圈**的那种状态 ——
+         链是挂死的，不是干脆报错的。把它当活链交出去，等于把
+         播放器钉在一条死链上，用户只能退出重播。
+    现在改成：每次交链都真探，且**必须探到「活着」才算活**。
+    实测一次探测只要 0.2 秒，代价远小于让用户对着转圈等。
     """
-    now = time.time()
-    if now - _probe_at.get(key, 0) < CAS_PROBE_INTERVAL:
-        return False
-    _probe_at[key] = now
-    verdict = _probe_link(url)
-    if verdict == PROBE_DEAD:
+    _probe_at[key] = time.time()
+    if _link_ready(url):
         _probe_suspect.pop(key, None)
-        return True
-    if verdict == PROBE_VAGUE:
-        if _probe_suspect.pop(key, None):
-            return True                 # 连续两次说不清 → 判死
-        if len(_probe_suspect) > 500:
-            _probe_suspect.clear()
-        _probe_suspect[key] = now
         return False
-    _probe_suspect.pop(key, None)
-    return False                        # 活着，或者压根没探成
+    return True
+
+
+def _link_ready(url, tries=2):
+    """这条链现在能不能真的取到数据 —— 必须探到「活着」才算数。
+
+    连探两次、任意一次拿到字节就算活，不是强迫症：CDN 边缘节点偶尔
+    会对一条**好链**抖一下（超时 / 5xx），一次判死会让好链被白白丢掉、
+    多跑一次秒传。反过来，坏链的应答要么是快速 4xx（实测 0.06 秒），
+    要么是干脆不回 —— 两种都不会因为多探一次而变好。
+    第二次用更短的超时，避免坏链把用户的开播等待拖成十几秒。
+
+    熔断期内一律返回 True：那是「我们探不到」，不是「链坏了」，
+    绝不能拿它去判死刑（否则就是还原风暴）。
+    """
+    if not _probe_usable():
+        return True
+    for i in range(max(1, tries)):
+        t = (CAS_LINK_VERIFY_TIMEOUT if i == 0
+             else CAS_LINK_VERIFY_RETRY_TIMEOUT)
+        if _probe_link(url, t) == PROBE_ALIVE:
+            return True
+    return False
 
 
 def _fresh_link_broken(key, url):
     """
-    刚签发的直链是不是根本用不了 —— 连续两次 4xx 才算。
+    刚签发的直链是不是根本用不了。
 
     为什么非要在交出去之前验一次：播放器 follow 302 之后就**钉死在这条
     URL 上**了，服务端后面再怎么重建、换链它都不知道，只能等用户退出去
     重播 —— 那就是「偶尔一直加载中」的全部成因。
 
-    连验两遍不是强迫症：CDN 边缘节点对刚秒传出来的文件常常要第一次请求
-    才触发回源，第一遍 4xx、第二遍就好了，而且这一探等于替播放器把回源
-    趟了一遍；真废了的链才会两遍都 4xx。
+    【v2.2.7 更正】以前这里写的是「连续两次明确 4xx 才判废」，也就是
+    「探不清（超时/5xx）算活」。这条规则漏掉的正好是转圈那一种：
+    链挂死不响应时，探测只会超时 —— 于是被判成「活」，照样交出去。
+    现在统一用 _link_ready：**拿不到字节就不算活**。
     """
-    _probe_at[key] = time.time()        # 刚探过，60 秒内别再重复探它
-    # 实测：刚秒传还原出来的文件，CDN 首字节 0.2s 就能拿到，热文件 0.18s，
-    # 冷/热几乎没有差别 —— 所以「等回源」纯属白等（v2.2.6 已撤销）。
-    # 这里只保留「连续两次明确 4xx 才判废」：一次 4xx 可能是边缘节点抖动，
-    # 两次都 4xx 才是真的废了。
-    if _probe_link(url, CAS_LINK_VERIFY_TIMEOUT) != PROBE_DEAD:
-        return False
-    return _probe_link(url, CAS_LINK_VERIFY_TIMEOUT) == PROBE_DEAD
+    _probe_at[key] = time.time()        # 刚探过，记一笔
+    return not _link_ready(url)
 
 
 def _verify_retry_allowed(key):
@@ -932,12 +1017,76 @@ def _cache_put(key, value):
                 _link_cache.pop(k, None)
 
 
-def _get_link(client, file_id):
+# ----------------------------------------------------------------------
+# 续播识别：把「接着上次进度回来」当成全新播放处理
+# ----------------------------------------------------------------------
+#
+# 用户实测出来的规律：**全新播放一部新片子从来不卡，只有续播才卡。**
+# 两者的差别只有一处 —— 续播时播放器带着一个非零起点的 Range 回来，
+# 而服务端这边还留着这部片子的旧直链、旧还原会话、旧临时文件。
+# 新片子那边一切都是空的，所以从不复现。
+#
+# 结论：与其去猜旧状态哪里坏了，不如**续播时把旧状态全部丢掉，
+# 走一条和全新播放一模一样的路**。状态空间直接坍缩，玄学无处藏身。
+RESUME_IDLE_GAP = 180      # 距上次来要链超过这么久，又带非零 Range → 判为续播
+_last_served = {}          # file_id -> 上次成功交链的时刻
+_last_served_lock = threading.Lock()
+
+
+def _range_start():
+    """播放器这次要的是从第几个字节开始。没带 Range、或从头开始 → 0。"""
+    rng = request.headers.get("Range") or ""
+    m = re.match(r"\s*bytes\s*=\s*(\d+)", rng, re.I)
+    return int(m.group(1)) if m else 0
+
+
+def _mark_served(file_id):
+    """记一笔：刚刚给这个片子交过链。"""
+    with _last_served_lock:
+        _last_served[file_id] = time.time()
+        if len(_last_served) > 2000:
+            # 表不能无限长；清空比逐个淘汰省事，误判代价也只是多走一次全新流程
+            _last_served.clear()
+            _last_served[file_id] = time.time()
+
+
+def _is_resume(file_id):
+    """这次请求是不是「播到一半退出去、过了一阵子回来接着播」。
+
+    判据两条，缺一不可：
+      1. 播放器带了一个**非零起点**的 Range —— 说明它要接着上次的进度；
+      2. 这个片子已经有一阵子没人来要链了 —— 说明不是播放过程中的 seek。
+
+    第 2 条很关键：播放中拖动进度条也会带非零 Range，但那是「几秒前
+    刚来要过链」的连续播放，绝不能当成续播去重新秒传 —— 那正是
+    v2.1.x「一分钟还原七八次」的老病根。
+    """
+    if _range_start() <= 0:
+        return False
+    with _last_served_lock:
+        last = _last_served.get(file_id, 0)
+    return (time.time() - last) > RESUME_IDLE_GAP
+
+
+def _get_link(client, file_id, resume=False):
+    """普通视频（非 .cas）的播放直链。
+
+    resume=True（续播）时把这条片子的旧链彻底丢掉，当全新播放处理。
+    """
+    if resume:
+        with _cache_lock:
+            _link_cache.pop(file_id, None)
+        app.logger.info("续播：普通直链按全新播放处理 %s", file_id[:12])
+
     now = time.time()
     with _cache_lock:
         cached = _link_cache.get(file_id)
         if cached and cached[1] > now:
-            return cached[0]
+            # 缓存命中也要现场验一次：坏了就重取，绝不把死链交出去
+            if _link_ready(cached[0]):
+
+                return cached[0]
+            app.logger.info("缓存的普通直链已失效，重新获取: %s", file_id[:12])
     url = client.get_download_url(file_id)
     # 普通视频的直链同样只有约 15 分钟寿命，缓存上限必须跟着收紧，
     # 否则缓存末期交出去的是一条马上要过期的链（续播就一直加载）
@@ -945,7 +1094,7 @@ def _get_link(client, file_id):
     return url
 
 
-def _get_cas_link(client, cfg, file_id, cas_name):
+def _get_cas_link(client, cfg, file_id, cas_name, resume=False):
     """
     .cas 文件的播放直链：秒传还原出临时文件，再把临时文件的直链 302 给播放器。
 
@@ -962,13 +1111,29 @@ def _get_cas_link(client, cfg, file_id, cas_name):
         直链假活后的换链重建），见 cas.SESSION_TTL；
       * 临时文件的删除时间跟着缓存走（缓存失效后再留 CAS_TEMP_GRACE 秒），
         文件永远活过直链，不依赖「删除不影响已签发直链」这类云盘行为；
-      * 直链交给播放器之前会自己先拉 1 个字节验一次，连续 4xx 就删掉重来
+      * 直链交给播放器之前会自己先拉 1 个字节验一次，拿不到字节就删掉重来
         （只重来一次）—— 播放器 follow 302 之后就钉死在那条 URL 上，
         这是唯一的补救窗口，错过就只能等用户「返回重播」。
+
+    resume=True（续播）：**把这部片子的旧状态全部丢掉，当全新播放处理** ——
+    旧直链、旧还原会话、探测节流、补救冷却，一个都不留。理由见
+    上面「续播识别」那一段的注释。
     """
     now = time.time()
     key = "cas:" + file_id
     restorer = get_restorer(cfg, client)
+
+    if resume:
+        # 续播 = 全新播放：旧状态一个都不信任
+        with _cache_lock:
+            _link_cache.pop(key, None)
+        restorer.forget_session(file_id)
+        _probe_at.pop(key, None)
+        _probe_suspect.pop(key, None)
+        # 补救冷却也清掉：这次的链是刚还原出来的，属于新的一轮，
+        # 不该被上一次播放的补救记录拦住（否则续播时探到坏链也不补救）
+        _verify_retried.pop(key, None)
+        app.logger.info("续播：.cas 按全新播放处理，丢弃旧直链与旧会话 %s", cas_name)
 
     with _cache_lock:
         cached = _link_cache.get(key)
@@ -980,11 +1145,23 @@ def _get_cas_link(client, cfg, file_id, cas_name):
                 temp_id, delay=max(int(restorer.temp_ttl or 0),
                                    int(expire - now + CAS_TEMP_GRACE)))
             return url
-        # 直链已经废了（多半是用户在云盘里手动删了临时文件）→ 重建
-        with _cache_lock:
-            _link_cache.pop(key, None)
-        restorer.forget_session(file_id)
-        app.logger.info("缓存的直链已失效（%s），重新还原", cas_name)
+        # 探测说这条链废了（多半是用户在云盘里手动删了临时文件）→ 想重建。
+        # 但重建必须受冷却约束：万一「探不到」其实是我们自己到 CDN 的路
+        # 不通（链对播放器是好的），没有冷却就会变成「来一个请求还原一份」
+        # 的还原风暴（v2.1.8 的血泪，一分钟七八次、堆几十 GB）。
+        # 宁可偶尔交一条存疑的链，也绝不重演还原风暴。
+        if _verify_retry_allowed(key):
+            with _cache_lock:
+                _link_cache.pop(key, None)
+            restorer.forget_session(file_id)
+            app.logger.info("缓存的直链已失效（%s），重新还原", cas_name)
+        else:
+            app.logger.warning(
+                "直链探测判定失效，但重建冷却中，先复用旧链: %s", cas_name)
+            restorer.schedule_delete(
+                temp_id, delay=max(int(restorer.temp_ttl or 0),
+                                   int(expire - now + CAS_TEMP_GRACE)))
+            return url
 
     url, size, temp_id, real_name, restored = restorer.fetch_link(file_id, cas_name)
     # 注意 and 的短路：只有确实探到坏链才会消耗掉那一次补救机会
@@ -1024,7 +1201,7 @@ def _cas_error_is_final(exc):
     return any(m in msg for m in _CAS_FATAL_MARKS)
 
 
-def _resolve_play_url(cfg, file_id, cas_name, use_cas):
+def _resolve_play_url(cfg, file_id, cas_name, use_cas, resume=False):
     """换取一条可用直链。成功返回 (url, None)，失败返回 (None, Response)。"""
     url, last_exc = None, None
     t0 = time.time()
@@ -1038,8 +1215,8 @@ def _resolve_play_url(cfg, file_id, cas_name, use_cas):
                 drop_client(cfg)
                 client = build_client(cfg)
                 client.init()
-            url = (_get_cas_link(client, cfg, file_id, cas_name) if use_cas
-                   else _get_link(client, file_id))
+            url = (_get_cas_link(client, cfg, file_id, cas_name, resume)
+                   if use_cas else _get_link(client, file_id, resume))
             break
         except (Yun139Error, CASError) as exc:
             last_exc = exc
@@ -1095,9 +1272,11 @@ def _proxy_stream(file_id, cfg, cas_name, use_cas):
     """
     import requests as _rq
 
-    url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas)
+    resume = _is_resume(file_id)
+    url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas, resume)
     if url is None:
         return err
+    _mark_served(file_id)
 
     def _open(u, rng):
         headers = {"Range": rng} if rng else {}
@@ -1114,7 +1293,7 @@ def _proxy_stream(file_id, cfg, cas_name, use_cas):
                         up.status_code, cas_name, file_id)
         up.close()
         _invalidate_link(file_id, use_cas, cfg)
-        url2, err2 = _resolve_play_url(cfg, file_id, cas_name, use_cas)
+        url2, err2 = _resolve_play_url(cfg, file_id, cas_name, use_cas, True)
         if url2 is None:
             return err2
         up = _open(url2, rng)
@@ -1165,18 +1344,21 @@ def direct_link(file_id):
         return _proxy_stream(file_id, cfg, cas_name, use_cas)
 
     t0 = time.time()
-    url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas)
+    resume = _is_resume(file_id)
+    url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas, resume)
     if url is None:
         _diag_add(ok=False, name=cas_name or file_id[:12], cas=use_cas,
-                  ms=int((time.time() - t0) * 1000),
+                  ms=int((time.time() - t0) * 1000), resume=resume,
                   err=(err.get_data(as_text=True) or "")[:160])
         return err
 
+    _mark_served(file_id)
     # 记下这条链还剩多久可用 —— 偶发「一直加载中」时，这是判断服务端
     # 有没有交出「快过期的链」的第一手证据
     life = int(_link_expire(url, LINK_TTL, CAS_LINK_MAX_TTL) - time.time())
     _diag_add(ok=True, name=cas_name or file_id[:12], cas=use_cas,
-              ms=int((time.time() - t0) * 1000), life=max(life, 0))
+              ms=int((time.time() - t0) * 1000), life=max(life, 0),
+              resume=resume)
     resp = redirect(url, code=302)
     resp.headers["Cache-Control"] = "no-store"
     return resp
