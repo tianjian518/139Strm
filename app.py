@@ -8,6 +8,7 @@
     播放时服务端换取移动云盘直链后 302 跳转，视频流不经过本机。
 """
 
+import collections
 import json
 import os
 import threading
@@ -901,22 +902,13 @@ def _fresh_link_broken(key, url):
     趟了一遍；真废了的链才会两遍都 4xx。
     """
     _probe_at[key] = time.time()        # 刚探过，60 秒内别再重复探它
-    # 探两遍：第一遍探不清（超时/5xx/说不清）时**等一会儿再探**，
-    # 给 CDN 把回源走完 —— 探成了再交链，播放器就不会撞上回源等待。
-    # 只有连续两次明确 4xx 才敢判这条链废了。
-    for attempt in (1, 2):
-        verdict = _probe_link(url, CAS_LINK_VERIFY_TIMEOUT)
-        if verdict == PROBE_ALIVE:
-            return False                       # 回源已完成，链可以用
-        if verdict == PROBE_DEAD and attempt == 2:
-            return True                        # 连续两次 4xx，确实废了
-        if attempt == 1:
-            app.logger.info("直链首探未就绪（%s），等待 CDN 回源后复探",
-                            "4xx" if verdict == PROBE_DEAD else "超时/说不清")
-            time.sleep(CAS_VERIFY_BACKOFF)
-    # 两遍都没探清：不敢判坏（可能是 CDN 不接受 Range 探测），
-    # 但已经替播放器等过一轮回源了
-    return False
+    # 实测：刚秒传还原出来的文件，CDN 首字节 0.2s 就能拿到，热文件 0.18s，
+    # 冷/热几乎没有差别 —— 所以「等回源」纯属白等（v2.2.6 已撤销）。
+    # 这里只保留「连续两次明确 4xx 才判废」：一次 4xx 可能是边缘节点抖动，
+    # 两次都 4xx 才是真的废了。
+    if _probe_link(url, CAS_LINK_VERIFY_TIMEOUT) != PROBE_DEAD:
+        return False
+    return _probe_link(url, CAS_LINK_VERIFY_TIMEOUT) == PROBE_DEAD
 
 
 def _verify_retry_allowed(key):
@@ -1172,12 +1164,52 @@ def direct_link(file_id):
     if cfg.get("play_proxy", False) or request.args.get("proxy"):
         return _proxy_stream(file_id, cfg, cas_name, use_cas)
 
+    t0 = time.time()
     url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas)
     if url is None:
+        _diag_add(ok=False, name=cas_name or file_id[:12], cas=use_cas,
+                  ms=int((time.time() - t0) * 1000),
+                  err=(err.get_data(as_text=True) or "")[:160])
         return err
+
+    # 记下这条链还剩多久可用 —— 偶发「一直加载中」时，这是判断服务端
+    # 有没有交出「快过期的链」的第一手证据
+    life = int(_link_expire(url, LINK_TTL, CAS_LINK_MAX_TTL) - time.time())
+    _diag_add(ok=True, name=cas_name or file_id[:12], cas=use_cas,
+              ms=int((time.time() - t0) * 1000), life=max(life, 0))
     resp = redirect(url, code=302)
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+# ----------------------------------------------------------------------
+# 播放诊断（最近若干次播放请求留痕，用于定位偶发的「一直加载中」）
+# ----------------------------------------------------------------------
+
+_DIAG_MAX = 40
+_diag = collections.deque(maxlen=_DIAG_MAX)
+_diag_lock = threading.Lock()
+
+
+def _diag_add(**kw):
+    kw["t"] = time.strftime("%m-%d %H:%M:%S")
+    with _diag_lock:
+        _diag.append(kw)
+
+
+@app.route("/api/diag")
+def api_diag():
+    """最近 40 次播放请求：成功/失败、耗时、交出去的直链还剩多久。"""
+    with _diag_lock:
+        items = list(_diag)[::-1]
+    return jsonify({"ok": True, "items": items})
+
+
+@app.route("/api/diag/clear", methods=["POST"])
+def api_diag_clear():
+    with _diag_lock:
+        _diag.clear()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/link/<path:file_id>")

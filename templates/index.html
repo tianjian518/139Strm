@@ -159,7 +159,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
       <div class="nav-item" data-page="settings">⚙️ 系统设置</div>
     </nav>
     <div class="sidebar-foot">
-      <div class="ver">v2.2.6 · 移动云盘直连</div>
+      <div class="ver">v2.2.7 · 移动云盘直连</div>
       <div class="exit-btn" onclick="alert('退出现在没有特殊作用，关闭浏览器即可。')">↩ 退出</div>
     </div>
   </aside>
@@ -299,6 +299,16 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
           <div>配置 &amp; 凭据：<span class="mono" id="stConfigPath">-</span> <span id="stConfigFlag"></span></div>
           <div>任务列表：<span class="mono" id="stTasksPath">-</span> <span id="stTasksFlag"></span></div>
           <div>STRM 输出：<span class="mono" id="stOutPath">-</span> <span id="stOutFlag"></span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🩺 播放诊断 <span class="sub">最近 40 次播放请求</span></div>
+        <div class="hint">偶发「一直加载中」时，先看这里：<b>红色=服务端没能给出直链</b>（会写明原因）；绿色的「直链余命」是交出去时这条链还剩多少秒可用。把红色的那条内容发给我，就能精准定位。</div>
+        <div id="diagBox" style="margin-top:8px;font-size:12px;line-height:1.9;max-height:240px;overflow:auto">加载中…</div>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button class="btn sec" onclick="loadDiag()">刷新</button>
+          <button class="btn sec" onclick="clearDiag()">清空记录</button>
         </div>
       </div>
 
@@ -665,6 +675,26 @@ async function loadConfig(){
   // 默认开启：老配置里没有这个键时也按开启处理
   $('playProxy').checked = !!j.play_proxy
   loadStorage()
+  loadDiag()
+}
+async function loadDiag(){
+  const box = $('diagBox'); if(!box) return
+  let j
+  try { j = await fetch('/api/diag').then(r=>r.json()) } catch(e){ box.textContent='读取失败'; return }
+  if (!j.ok || !j.items || !j.items.length){ box.innerHTML='<div style="opacity:.6">暂无播放记录</div>'; return }
+  box.innerHTML = j.items.map(it=>{
+    const color = it.ok ? '#16a34a' : '#dc2626'
+    const info = it.ok
+      ? `耗时 ${it.ms}ms · 直链余命 ${it.life}s${it.cas?' · CAS秒传':''}`
+      : `❌ ${(it.err||'未知原因').replace(/</g,'&lt;')}`
+    return `<div style="padding:3px 0;border-bottom:1px solid rgba(128,128,128,.15)">
+      <span style="color:${color}">●</span> ${it.t}
+      · <b>${(it.name||'').replace(/</g,'&lt;').slice(0,26)}</b>
+      <span style="opacity:.75">${info}</span></div>`
+  }).join('')
+}
+async function clearDiag(){
+  await fetch('/api/diag/clear',{method:'POST'}); loadDiag()
 }
 async function loadStorage(){
   let j
