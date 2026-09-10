@@ -159,7 +159,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
       <div class="nav-item" data-page="settings">⚙️ 系统设置</div>
     </nav>
     <div class="sidebar-foot">
-      <div class="ver">v2.2.8 · 移动云盘直连</div>
+      <div class="ver">v2.2.9 · 移动云盘直连</div>
       <div class="exit-btn" onclick="alert('退出现在没有特殊作用，关闭浏览器即可。')">↩ 退出</div>
     </div>
   </aside>
@@ -308,6 +308,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
         <div id="diagBox" style="margin-top:8px;font-size:12px;line-height:1.9;max-height:240px;overflow:auto">加载中…</div>
         <div style="display:flex;gap:8px;margin-top:8px">
           <button class="btn sec" onclick="loadDiag()">刷新</button>
+          <button class="btn sec" onclick="copyDiag(event)">复制诊断</button>
           <button class="btn sec" onclick="clearDiag()">清空记录</button>
         </div>
       </div>
@@ -693,12 +694,42 @@ async function loadDiag(){
     const info = it.ok
       ? `耗时 ${it.ms}ms · 直链余命 ${it.life}s${it.cas?' · CAS秒传':''}`
       : `❌ ${(it.err||'未知原因').replace(/</g,'&lt;')}`
-    return `<div style="padding:3px 0;border-bottom:1px solid rgba(128,128,128,.15)">
+    // 播放器发过来的原始 Range：卡住时这是最关键的一条证据
+    const rng = it.rng
+      ? `<span style="color:#7c3aed">Range: ${String(it.rng).replace(/</g,'&lt;')}</span>`
+      : '<span style="opacity:.5">无 Range</span>'
+    const gap = (typeof it.gap === 'number' && it.gap > 0)
+      ? `<span style="opacity:.6">距上次 ${it.gap}s</span>` : ''
+    return `<div style="padding:4px 0;border-bottom:1px solid rgba(128,128,128,.15)">
       <span style="color:${color}">●</span> ${it.t}
       · ${tag}
-      <b>${(it.name||'').replace(/</g,'&lt;').slice(0,26)}</b>
-      <span style="opacity:.75">${info}</span></div>`
+      <b>${(it.name||'').replace(/</g,'&lt;').slice(0,24)}</b>
+      <span style="opacity:.75">${info}</span>
+      <div style="padding-left:14px;font-size:11px">${rng} ${gap}
+        <span style="opacity:.45">${(it.ua||'').replace(/</g,'&lt;')}</span></div></div>`
   }).join('')
+}
+async function copyDiag(ev){
+  const btn = ev && ev.target
+  let j
+  try { j = await fetch('/api/diag').then(r=>r.json()) } catch(e){ return }
+  if (!j.items || !j.items.length){ alert('暂无播放记录'); return }
+  const lines = j.items.map(it => {
+    const parts = [it.t, it.resume ? '续播' : '新播', (it.name||'').slice(0,30)]
+    parts.push(it.ok ? `成功 耗时${it.ms}ms 余命${it.life}s` : `失败 ${it.err||''}`)
+    parts.push(`Range=${it.rng||'(无)'}`)
+    if (it.gap) parts.push(`距上次${it.gap}s`)
+    if (it.ua) parts.push(it.ua)
+    return parts.join(' | ')
+  })
+  const text = '【139Strm 播放诊断】\n' + lines.join('\n')
+  try {
+    await navigator.clipboard.writeText(text)
+    if (btn) { btn.textContent='已复制 ✓'; setTimeout(()=>btn.textContent='复制诊断', 1500) }
+  } catch(e) {
+    // 剪贴板不可用时退化为弹窗，手动长按复制
+    prompt('长按复制以下内容：', text)
+  }
 }
 async function clearDiag(){
   await fetch('/api/diag/clear',{method:'POST'}); loadDiag()

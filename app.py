@@ -50,7 +50,7 @@ LINK_TTL = 2 * 3600  # 直链有时效，缓存 2 小时
 CAS_LINK_MAX_TTL = 4 * 60
 # 直链缓存失效后，临时文件再多留一会儿（防止最后一波 Range 请求打空）
 CAS_TEMP_GRACE = 120
-# 【v2.2.8 已废除】CAS_PROBE_INTERVAL 曾经是「缓存期内最多 60 秒探一次」的
+# 【v2.2.9 已废除】CAS_PROBE_INTERVAL 曾经是「缓存期内最多 60 秒探一次」的
 # 节流。实测下来这个节流得不偿失：省下的那点探测开销，代价是这 60 秒窗口里
 # 链坏了照样往外发，而 302 直连下播放器一旦拿到链就钉死、服务端事后无法补救。
 # 现在改成**每次交链都真探**，一次只要 0.2 秒。留着这个名字只为让老配置和
@@ -805,7 +805,7 @@ def api_strm_status():
 def _amz_deadline(url):
     """从预签名直链里读出**真正的**过期时刻（unix 秒）；读不到返回 None。
 
-    实测（v2.2.8）：139 给的是对象存储的预签名 URL，形如
+    实测（v2.2.9）：139 给的是对象存储的预签名 URL，形如
         https://<bucket>.eos.<region>.cmecloud.cn/<obj>
             ?X-Amz-Algorithm=AWS4-HMAC-SHA256
             &X-Amz-Date=20260910T012236Z      ← 签发时刻（UTC）
@@ -831,7 +831,7 @@ def _amz_deadline(url):
 def _link_expire(url, default_ttl, max_ttl=None):
     """按直链自己的过期时间来决定缓存多久。
 
-    【v2.2.8 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
+    【v2.2.9 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
     「t 是过期时间戳」。实际上 `t` 恒等于 2 —— 那是个标志位，不是
     时间戳。于是 `now - 86400 < 2 < now + 86400` 永远不成立，判断
     永远落空，**永远走兜底值**。连带后果是诊断页里显示的「直链余命」
@@ -939,7 +939,7 @@ def _cas_link_dead(key, url):
     """
     缓存里的这条直链**现在**还能不能真的取到数据。
 
-    【v2.2.8 重要更正】以前这里有两个要命的设计：
+    【v2.2.9 重要更正】以前这里有两个要命的设计：
       1. 60 秒节流：同一个片子最多 60 秒探一次。省下的那点时间，
          代价是这 60 秒窗口里链坏了照样往外发 —— 302 直连下播放器
          一旦拿到链就钉死，服务端事后无法补救。
@@ -987,7 +987,7 @@ def _fresh_link_broken(key, url):
     URL 上**了，服务端后面再怎么重建、换链它都不知道，只能等用户退出去
     重播 —— 那就是「偶尔一直加载中」的全部成因。
 
-    【v2.2.8 更正】以前这里写的是「连续两次明确 4xx 才判废」，也就是
+    【v2.2.9 更正】以前这里写的是「连续两次明确 4xx 才判废」，也就是
     「探不清（超时/5xx）算活」。这条规则漏掉的正好是转圈那一种：
     链挂死不响应时，探测只会超时 —— 于是被判成「活」，照样交出去。
     现在统一用 _link_ready：**拿不到字节就不算活**。
@@ -1031,6 +1031,11 @@ def _cache_put(key, value):
 RESUME_IDLE_GAP = 180      # 距上次来要链超过这么久，又带非零 Range → 判为续播
 _last_served = {}          # file_id -> 上次成功交链的时刻
 _last_served_lock = threading.Lock()
+# 每个片子**每一次**来请求的时刻（不管成没成）。用来算「距上次请求隔了多久」——
+# 这是判断「这次是续播还是播放中的 seek」最直接的证据，也是排查
+# 「隔夜续播一直加载中」时最关键的一个数字。
+_last_seen = {}
+_last_seen_lock = threading.Lock()
 
 
 def _range_start():
@@ -1344,11 +1349,25 @@ def direct_link(file_id):
         return _proxy_stream(file_id, cfg, cas_name, use_cas)
 
     t0 = time.time()
+    # ---- 把「播放器到底发了什么」原样记下来 ----
+    # 服务端能查的环节都查过了：隔夜续播和全新播放走的路径完全一样，
+    # 交出去的链也实测是好的（任意偏移 Range 均 206、0.2 秒）。
+    # 那就只剩「播放器 302 之后发生了什么」这一片盲区 —— 唯一的办法
+    # 是把它发过来的原始请求头留证。这样用户卡住时不用翻日志，
+    # 服务端自己就记着。
+    rng_raw = request.headers.get("Range") or ""
+    ua_raw = request.headers.get("User-Agent") or ""
+    with _last_seen_lock:
+        gap = int(time.time() - _last_seen.get(file_id, 0))
+        _last_seen[file_id] = time.time()
+        if len(_last_seen) > 2000:
+            _last_seen.clear()
     resume = _is_resume(file_id)
     url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas, resume)
     if url is None:
         _diag_add(ok=False, name=cas_name or file_id[:12], cas=use_cas,
                   ms=int((time.time() - t0) * 1000), resume=resume,
+                  rng=rng_raw, ua=ua_raw[:40], gap=gap,
                   err=(err.get_data(as_text=True) or "")[:160])
         return err
 
@@ -1358,9 +1377,15 @@ def direct_link(file_id):
     life = int(_link_expire(url, LINK_TTL, CAS_LINK_MAX_TTL) - time.time())
     _diag_add(ok=True, name=cas_name or file_id[:12], cas=use_cas,
               ms=int((time.time() - t0) * 1000), life=max(life, 0),
-              resume=resume)
+              resume=resume, rng=rng_raw, ua=ua_raw[:40], gap=gap)
     resp = redirect(url, code=302)
-    resp.headers["Cache-Control"] = "no-store"
+    # 防缓存头给全：任何一层（播放器自己的 HTTP 栈、中间反代）只要缓存了
+    # 这个 302，之后就会一直用那条会过期的云盘直链 —— 表现就是
+    # 「隔夜续播一直加载中，返回重播才好」。
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    resp.headers["Accept-Ranges"] = "bytes"
     return resp
 
 
