@@ -159,7 +159,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
       <div class="nav-item" data-page="settings">⚙️ 系统设置</div>
     </nav>
     <div class="sidebar-foot">
-      <div class="ver">v2.2.17 · 移动云盘直连</div>
+      <div class="ver">v2.2.18 · 移动云盘直连</div>
       <div class="exit-btn" onclick="alert('退出现在没有特殊作用，关闭浏览器即可。')">↩ 退出</div>
     </div>
   </aside>
@@ -705,12 +705,17 @@ async function loadDiag(){
       : '<span style="opacity:.5">无 Range</span>'
     const gap = (typeof it.gap === 'number' && it.gap > 0)
       ? `<span style="opacity:.6">距上次 ${it.gap}s</span>` : ''
+    // 「换文件」：这次把临时文件换成了新的（旧的会被清掉）。
+    // 播放中频繁出现这个标记，就会让画面「跳回起播点」。
+    const nf = it.newfile === true
+      ? '<b style="color:#dc2626">🔄换了新文件</b> '
+      : (it.newfile === false ? '<span style="opacity:.5">复用文件</span> ' : '')
     return `<div style="padding:4px 0;border-bottom:1px solid rgba(128,128,128,.15)">
       <span style="color:${color}">●</span> ${it.t}
       · ${tag}
       <b>${(it.name||'').replace(/</g,'&lt;').slice(0,24)}</b>
       <span style="opacity:.75">${info}</span>
-      <div style="padding-left:14px;font-size:11px">${rng} ${gap} ${calls}
+      <div style="padding-left:14px;font-size:11px">${rng} ${gap} ${calls} ${nf}
         <span style="opacity:.45">${(it.ua||'').replace(/</g,'&lt;')}</span></div></div>`
   }).join('')
 }
@@ -725,6 +730,8 @@ async function copyDiag(ev){
     parts.push(`Range=${it.rng||'(无)'}`)
     if (it.gap) parts.push(`距上次${it.gap}s`)
     if (it.calls) parts.push(`来回${it.calls}个/${it.call_ms}ms`)
+    if (it.newfile === true) parts.push('换了新文件')
+    else if (it.newfile === false) parts.push('复用文件')
     if (it.ua) parts.push(it.ua)
     return parts.join(' | ')
   })
