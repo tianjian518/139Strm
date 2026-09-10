@@ -38,7 +38,14 @@ LINK_TTL = 2 * 3600  # 直链有时效，缓存 2 小时
 # CAS 直链指向的是「秒传还原出来的临时文件」，缓存不能比直链自己的寿命还长。
 # 这里只设上限与兜底，真正的缓存时长取直链 t= 参数（见 _link_expire）；
 # 缓存失效时优先复用已还原的临时文件重新取链，只有文件没了才重新秒传。
-CAS_LINK_MAX_TTL = 15 * 60
+#
+# 关键：这个值必须**远小于**直链寿命（移动云盘实测约 15 分钟）。
+# 302 直连下播放器 follow 之后就钉死在拿到的那条链上，服务端无从补救，
+# 所以交出去的链必须留足余量。以前设成 15 分钟（≈直链寿命），
+# 结果缓存快到期时返回的是一条只剩一两分钟的链 —— 表现就是
+# 「播一会儿又卡 / 续播一直加载」。现在固定 4 分钟，
+# 保证任何一次请求拿到的链都还有 11 分钟以上可用。
+CAS_LINK_MAX_TTL = 4 * 60
 # 直链缓存失效后，临时文件再多留一会儿（防止最后一波 Range 请求打空）
 CAS_TEMP_GRACE = 120
 # 缓存期内多久探一次直链是否还活着（秒）。设这个是为了接住「用户手动清空了
@@ -104,11 +111,13 @@ DEFAULT_CONFIG = {
     "cas_allow_all_ext": False,  # False=只还原视频；True=任何后缀都还原
     "cas_temp_dir_id": "",     # 记住临时目录 ID，避免重启后重复创建
     # ---- 播放方式 ----
-    # True=代理转发（默认）：视频流经本机中转，直链随时可换，
-    #      彻底消灭「播到一半 / 续播一直加载中」；代价是占用本机上行带宽。
-    # False=302 直连：流量不经过本机，但播放器钉死在旧直链上，
-    #      直链 15 分钟过期后只能退出重播。
-    "play_proxy": True,
+    # False=302 直连（默认，推荐）：视频流量从移动云盘 CDN 直达播放器，
+    #      不经过部署服务器 —— 云服务器（甲骨文等）务必保持这个设置，
+    #      否则每个视频都会吃掉服务器的上行流量配额。
+    # True=代理转发：视频流经服务器中转，直链过期可随时换，能消灭
+    #      「播到一半 / 续播一直加载中」，但流量全部走服务器带宽。
+    #      只适合服务器就在家里（局域网播放无带宽顾虑）的场景。
+    "play_proxy": False,
 }
 
 
@@ -918,7 +927,9 @@ def _get_link(client, file_id):
         if cached and cached[1] > now:
             return cached[0]
     url = client.get_download_url(file_id)
-    _cache_put(file_id, (url, _link_expire(url, LINK_TTL)))
+    # 普通视频的直链同样只有约 15 分钟寿命，缓存上限必须跟着收紧，
+    # 否则缓存末期交出去的是一条马上要过期的链（续播就一直加载）
+    _cache_put(file_id, (url, _link_expire(url, LINK_TTL, CAS_LINK_MAX_TTL)))
     return url
 
 
@@ -1136,10 +1147,9 @@ def direct_link(file_id):
     cas_name = request.args.get("cas") or ""
     use_cas = (bool(cas_name) and is_cas_name(cas_name)
                and cfg.get("cas_enabled", True))
-    # 代理模式（默认）：流量经本机转发，直链随时可换，
-    # 彻底消灭「播到一半 / 续播一直加载中」。
-    # ?direct=1 可临时退回直连，系统设置里也能整体关掉。
-    if cfg.get("play_proxy", True) and not request.args.get("direct"):
+    # 默认 302 直连：视频流从云盘 CDN 直达播放器，不消耗服务器带宽。
+    # ?proxy=1 可临时开启代理转发（服务器在家里才适合）。
+    if cfg.get("play_proxy", False) or request.args.get("proxy"):
         return _proxy_stream(file_id, cfg, cas_name, use_cas)
 
     url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas)

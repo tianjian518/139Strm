@@ -159,7 +159,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
       <div class="nav-item" data-page="settings">⚙️ 系统设置</div>
     </nav>
     <div class="sidebar-foot">
-      <div class="ver">v2.2.4 · 移动云盘直连</div>
+      <div class="ver">v2.2.5 · 移动云盘直连</div>
       <div class="exit-btn" onclick="alert('退出现在没有特殊作用，关闭浏览器即可。')">↩ 退出</div>
     </div>
   </aside>
@@ -348,11 +348,13 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
             <label class="checkbox"><input id="casAllowAll" type="checkbox"> 任何后缀都还原（默认只还原视频）</label>
           </div>
           <div>
-            <label class="checkbox"><input id="playProxy" type="checkbox" checked> 代理转发播放（推荐）</label>
+            <label class="checkbox"><input id="playProxy" type="checkbox"> 代理转发播放（<b>一般不推荐</b>）</label>
           </div>
           <div class="hint" style="font-size:12px;opacity:.75;margin-top:4px">
-            开启：视频流经本机中转，直链过期会自动换新的，<b>续播/长时间播放不会卡住</b>（会占用本机上行带宽）。<br>
-            关闭：302 直连，流量不经过本机，但播放器会钉死在旧直链上，约 15 分钟后需退出重播。
+            <b>默认关闭 = 302 直连</b>：视频从云盘 CDN 直达播放器，<b>不消耗服务器带宽</b>。<br>
+            ⚠️ 开启后视频流全部经过本机中转 —— <b>服务器在云端（甲骨文/腾讯云等）千万别开</b>，
+            会吃掉大量上行流量配额。只有服务器就在家里（局域网播放）才适合开，
+            好处是直链过期可自动换新、长时间播放不中断。
           </div>
         </div>
         <div style="display:flex;gap:8px;margin-top:10px">
@@ -661,7 +663,7 @@ async function loadConfig(){
   $('casTtl').value = j.cas_temp_ttl || 300
   $('casAllowAll').checked = !!j.cas_allow_all_ext
   // 默认开启：老配置里没有这个键时也按开启处理
-  $('playProxy').checked = j.play_proxy !== false
+  $('playProxy').checked = !!j.play_proxy
   loadStorage()
 }
 async function loadStorage(){

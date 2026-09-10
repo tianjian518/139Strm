@@ -60,9 +60,17 @@ DEFAULT_TEMP_TTL = 300
 #     guangyapan-src）被生产验证顺畅的模式：每次播放请求即秒传即取链，
 #     零历史状态可依赖，也就没有任何"旧实体出状况"的坑可踩。
 # 历史：曾 12 小时（隔夜续播复用旧实体 → 「昨天最后看的部今天早上
-# 必卡」）→ 4 小时（v2.1.12）→ 90 秒（v2.2.0）。复用窗口越短，
-# 能出状况的状态存活期就越短；90 秒内文件刚创建、几乎不可能出状况。
-SESSION_TTL = 90
+# 必卡」）→ 4 小时（v2.1.12）→ 90 秒（v2.2.0）。
+#
+# v2.2.5 改成 5 分钟 + **滑动续期**（每次复用都把寿命往后推），理由是：
+# 直链缓存上限是 4 分钟，播放器每 4 分钟回来换一次链；会话只有 90 秒时，
+# 换链的那一刻会话早过期了，只能重新秒传 —— 一部片子播一小时就要
+# 秒传十几回，既慢又容易堆副本。放宽到 5 分钟后，连续播放全程复用
+# 同一个临时文件、只换直链，停止播放没人续期，5 分钟自然过期被清理。
+# 安全性不靠时长兜底，靠两道硬校验：复用前查文件真实存在
+# （_temp_file_exists），直链交出前拉 1 个字节验活（_fresh_link_broken）。
+# 会话寿命(300s) < 临时文件寿命(360s)，会话永远比文件先过期。
+SESSION_TTL = 5 * 60
 
 # 兼容旧名（外部若有引用）
 MAX_SESSION_TTL = SESSION_TTL
@@ -691,19 +699,23 @@ class CASRestorer:
         return exists
 
     def _reuse_link(self, cas_file_id, cas_name, sess):
-        """复用已还原的临时文件重新取直链；返回直链或空串。
+        """复用已还原的临时文件重新取一条直链；返回直链或空串。
 
-        取不到链时顺手丢弃会话。幂等窗口只有 90 秒，正常复用
-        （探测后播放、并发请求）间隔是秒级 —— 超过 60 秒的复用
-        记一条日志，万一真出了状况它就是第一现场。
+        调用方（_take_reusable_session）已经确认过临时文件在云盘里真实存在，
+        走到这里就一律复用、不再秒传 —— 这是「长时间播放不中断、
+        临时目录不堆副本」的关键。
+
+        每次成功复用都把会话寿命往后推（滑动续期）：连续播放时一个临时
+        文件可以一直用下去，只在停止播放、没人续期之后才自然过期被清理，
+        下次续播再全新秒传。取不到链说明文件已不在，丢弃会话改走秒传。
         """
-        age = time.time() - sess["created_at"]
-        if age > 60:
-            logger.info("复用 %.1f 分钟前的还原会话: %s（临时文件 %s）",
-                        age / 60, cas_name, sess["temp_id"])
         link = self._refresh_link(sess["temp_id"])
         if not link:
             self._drop_session(cas_file_id)
+            return ""
+        with self._state_lock:
+            sess["created_at"] = time.time()      # 滑动续期
+        logger.info("复用临时文件换直链（未重新秒传）: %s", cas_name)
         return link
 
     def _take_reusable_session(self, cas_file_id, cas_name):
