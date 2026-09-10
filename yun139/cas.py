@@ -80,7 +80,20 @@ MAX_SESSION_TTL = SESSION_TTL
 # 播放器就多一分「一直加载中」的超时风险。60 秒内用户恰好删掉
 # 临时目录的概率可以忽略；真删了，秒传会失败并触发强制重查（见
 # _create_in_temp_dir），不会卡死。
-DIR_CHECK_INTERVAL = 60
+#
+# 【v2.2.11】60 秒 → 600 秒。这台服务器可能在海外，每次 list 根目录
+# 都要跨国际线路走一趟；而「用户恰好在 10 分钟内删掉临时目录」这种事
+# 概率极低，且真发生了也有兜底（秒传失败 → 强制重查重试），不会卡死。
+DIR_CHECK_INTERVAL = 600
+
+# .cas 解析结果的落盘缓存放在哪：跟 config.json 放一起。
+# 放这里的好处是它跟着「配置卷」走 —— 容器重建、升级镜像都不会丢。
+def _cas_cache_path():
+    cfg = os.environ.get("CONFIG_PATH") or ""
+    if not cfg:
+        return ""
+    d = os.path.dirname(os.path.abspath(cfg))
+    return os.path.join(d, "cas_cache.json") if d else ""
 
 # 「只还原视频」时的白名单。.iso 是蓝光/DVD 原盘，也是正儿八经的
 # 视频容器（用户拿 139Strm 存原盘很常见）—— 以前漏了它，导致原盘
@@ -271,6 +284,9 @@ class CASRestorer:
         self._dir_checked_at = 0.0
         # .cas 解析结果缓存：file_id -> (CASInfo, 时刻)，见 CAS_PARSE_CACHE_TTL
         self._cas_cache = {}
+        # 解析缓存落盘文件（跨重启/隔夜仍然有效），懒加载
+        self._cas_cache_file = _cas_cache_path()
+        self._cas_cache_loaded = False
         # 会话临时文件存在性校验的结果缓存：temp_id -> (是否存在, 时刻)。
         # 避免并发请求各自 list 一遍临时目录。
         self._exist_cache = {}
@@ -292,8 +308,13 @@ class CASRestorer:
         再 GET 内容），而换链/重播每次都要走一遍还原 —— 缓存解析结果
         能直接省掉这两次往返。同一个 file_id 的 .cas 内容不会变，
         缓存 6 小时安全（换链通常 15 分钟一次）。
+
+        【v2.2.11】缓存改为**落盘**：以前只在内存里，容器一重启或隔夜
+        就全没了，续播又要重新付这两次往返 —— 而服务器如果在海外，
+        这两次就是好几秒。这两秒是纯浪费，因为它取的东西永远不变。
         """
         now = time.time()
+        self._ensure_cas_cache_loaded()
         with self._state_lock:
             hit = self._cas_cache.get(file_id)
         if hit and now - hit[1] < CAS_PARSE_CACHE_TTL:
@@ -308,7 +329,60 @@ class CASRestorer:
                 for k in sorted(self._cas_cache, key=lambda x: self._cas_cache[x][1])[
                         :len(self._cas_cache) // 4]:
                     self._cas_cache.pop(k, None)
+        self._save_cas_cache()
         return info
+
+    # ------------------------------------------------------------------
+    # 解析缓存落盘
+    # ------------------------------------------------------------------
+
+    def _ensure_cas_cache_loaded(self):
+        """第一次用到时把磁盘上的解析缓存读回来。"""
+        if self._cas_cache_loaded:
+            return
+        self._cas_cache_loaded = True
+        path = self._cas_cache_file
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except Exception as exc:
+            logger.info("读取 .cas 解析缓存失败（忽略）: %s", exc)
+            return
+        now = time.time()
+        n = 0
+        for fid, item in (raw.get("items") or {}).items():
+            try:
+                ts = float(item.get("t") or 0)
+                if now - ts >= CAS_PARSE_CACHE_TTL:
+                    continue
+                self._cas_cache[fid] = (
+                    CASInfo(**(item.get("info") or {})), ts)
+                n += 1
+            except Exception:
+                continue
+        if n:
+            logger.info("已从磁盘恢复 %d 条 .cas 解析缓存（省下 %d 次接口往返）",
+                        n, n * 2)
+
+    def _save_cas_cache(self):
+        """把解析缓存写回磁盘（原子写，失败不影响播放）。"""
+        path = self._cas_cache_file
+        if not path:
+            return
+        try:
+            with self._state_lock:
+                items = {}
+                for fid, (info, ts) in self._cas_cache.items():
+                    items[fid] = {"t": ts, "info": {
+                        k: getattr(info, k) for k in info.__slots__}}
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"items": items}, fh, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.info("写入 .cas 解析缓存失败（忽略）: %s", exc)
 
     # ------------------------------------------------------------------
     # 临时目录

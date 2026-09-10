@@ -10,6 +10,7 @@
 """
 
 import base64
+import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,24 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 from . import crypto
+
+# 当前线程的云盘接口总时限（见 Yun139Client.set_deadline）。
+# 用 thread-local 而不是实例属性：client 是按账号缓存、多线程共用的，
+# 把时限挂在实例上会被别的请求串改。
+_deadline = threading.local()
+
+
+def set_request_deadline(seconds):
+    """给当前线程设一个云盘接口总时限（秒）；0 = 不限制。
+
+    给调用方（播放路由）用的：不必先拿到 client 实例就能设。
+    超时后所有云盘接口调用都会快速失败，而不是继续一个个挂下去。
+    """
+    _deadline.until = (time.time() + seconds) if seconds else 0
+
+
+def clear_request_deadline():
+    _deadline.until = 0
 
 CLOUD_TYPES = ("personal_new", "personal", "family", "group")
 
@@ -65,7 +84,17 @@ class FileItem:
 
 class Yun139Client:
     def __init__(self, authorization="", cloud_type="personal_new",
-                 mail_cookies="", username="", cloud_id="", timeout=30):
+                 mail_cookies="", username="", cloud_id="", timeout=(6, 12)):
+        """timeout 默认 (连接 6 秒, 读取 12 秒)。
+
+        【v2.2.11 重要修复】以前这里是 30 —— 单次接口调用最多能挂 30 秒。
+        而一次冷启动续播要跟云盘打 9 个来回，只要有两次撞上线路抖动，
+        用户就要干等 60 秒以上，播放器全程转圈（用户原话：「加载 1 分钟
+        都不播放」）。国内本地部署感觉不到，海外服务器（甲骨文）跨国际
+        线路访问国内接口时非常常见。
+        现在压到 (6, 12)：单次最多 12 秒，配合下面的请求总时限，
+        最坏情况也只是「等十几秒后失败重试」，绝不会无限期转圈。
+        """
         if cloud_type not in CLOUD_TYPES:
             raise Yun139Error(f"不支持的云类型: {cloud_type}，可选 {CLOUD_TYPES}")
         self.authorization = (authorization or "").strip()
@@ -82,6 +111,38 @@ class Yun139Client:
         self.root_folder_id = "/" if cloud_type == "personal_new" else "root"
 
         self._session = requests.Session()
+        self._install_deadline_guard()
+
+    # ------------------------------------------------------------------
+    # 请求总时限
+    # ------------------------------------------------------------------
+    #
+    # 单次超时只能管住「一次调用」，管不住「一串调用叠起来」。一次冷启动
+    # 续播要串行打 9 个来回，每个最多 12 秒 —— 叠起来还是能到一分多钟。
+    # 所以这里再加一道总闸：调用方给一个总时限，超了就直接快速失败，
+    # 让播放器立刻拿到结果去重试（重试时状态已热，秒开），
+    # 而不是让用户对着转圈等下去。
+    def _install_deadline_guard(self):
+        raw_request = self._session.request
+        client = self
+
+        def _guarded(method, url, **kw):
+            until = getattr(_deadline, "until", 0)
+            if until and time.time() > until:
+                raise Yun139Error(
+                    "云盘接口响应太慢，已超过本次播放的等待上限 —— "
+                    "请重试（重试会快很多）")
+            kw.setdefault("timeout", client.timeout)
+            return raw_request(method, url, **kw)
+
+        self._session.request = _guarded
+
+    def set_deadline(self, seconds):
+        """给**当前线程**设一个云盘接口总时限（秒）。0 = 不限制。"""
+        set_request_deadline(seconds)
+
+    def clear_deadline(self):
+        set_request_deadline(0)
 
     # ------------------------------------------------------------------
     # 凭据处理

@@ -20,7 +20,8 @@ from datetime import datetime
 from flask import Flask, jsonify, render_template, request, redirect, Response
 
 from yun139 import crypto
-from yun139.client import Yun139Client, Yun139Error, CLOUD_TYPES
+from yun139.client import (Yun139Client, Yun139Error, CLOUD_TYPES,
+                           set_request_deadline, clear_request_deadline)
 from yun139.strm import (StrmGenerator, DEFAULT_MEDIA_EXT, DEFAULT_COPY_EXT,
                          sanitize_name, CancelError)
 from yun139 import cas as cas_mod
@@ -50,7 +51,7 @@ LINK_TTL = 2 * 3600  # 直链有时效，缓存 2 小时
 CAS_LINK_MAX_TTL = 4 * 60
 # 直链缓存失效后，临时文件再多留一会儿（防止最后一波 Range 请求打空）
 CAS_TEMP_GRACE = 120
-# 【v2.2.10 已废除】CAS_PROBE_INTERVAL 曾经是「缓存期内最多 60 秒探一次」的
+# 【v2.2.11 已废除】CAS_PROBE_INTERVAL 曾经是「缓存期内最多 60 秒探一次」的
 # 节流。实测下来这个节流得不偿失：省下的那点探测开销，代价是这 60 秒窗口里
 # 链坏了照样往外发，而 302 直连下播放器一旦拿到链就钉死、服务端事后无法补救。
 # 现在改成**每次交链都真探**，一次只要 0.2 秒。留着这个名字只为让老配置和
@@ -71,10 +72,22 @@ CAS_LINK_VERIFY_TIMEOUT = 2      # 第一次探测超时（秒）
 CAS_LINK_VERIFY_RETRY_TIMEOUT = 1.5  # 复探超时（秒）
 CAS_VERIFY_BACKOFF = 1.2         # 探不清时退避多久再探一次
 
+# 一次播放请求里，允许花在「跟云盘打交道」上的总时间（秒）。
+#
+# 为什么必须有这个：一次冷启动续播要串行打 9 个云盘接口来回（取 client、
+# 读 .cas、列临时目录、秒传创建、取直链……）。国内本地部署 1.6 秒就跑完，
+# 感觉不到；但服务器在海外（甲骨文）跨国际线路访问国内接口时，每个来回
+# 都可能抖动。单个接口超时就算压到 12 秒，9 个叠起来也能到一分多钟 ——
+# 用户看到的就是「一直加载中，加载 1 分钟都不播放」。
+#
+# 有了总时限，最坏情况变成「等 25 秒后快速失败」，播放器立刻能去重试，
+# 而重试时状态已经热了（client 已建、.cas 已解析、临时目录已知）→ 秒开。
+PLAY_REQUEST_DEADLINE = 25
+
 # ----------------------------------------------------------------------
 # 探测熔断：防止「探不到 → 判链死刑 → 重建」演变成还原风暴
 # ----------------------------------------------------------------------
-# 【v2.2.10 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
+# 【v2.2.11 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
 #
 # 事情是这样的：交链前探测直链，是 v2.2.3 才加进来的。v2.2.2 及以前
 # 交链前**完全不探测**，而那一版在生产上跑了很久、从没出过问题。
@@ -818,7 +831,7 @@ def api_strm_status():
 def _amz_deadline(url):
     """从预签名直链里读出**真正的**过期时刻（unix 秒）；读不到返回 None。
 
-    实测（v2.2.10）：139 给的是对象存储的预签名 URL，形如
+    实测（v2.2.11）：139 给的是对象存储的预签名 URL，形如
         https://<bucket>.eos.<region>.cmecloud.cn/<obj>
             ?X-Amz-Algorithm=AWS4-HMAC-SHA256
             &X-Amz-Date=20260910T012236Z      ← 签发时刻（UTC）
@@ -844,7 +857,7 @@ def _amz_deadline(url):
 def _link_expire(url, default_ttl, max_ttl=None):
     """按直链自己的过期时间来决定缓存多久。
 
-    【v2.2.10 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
+    【v2.2.11 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
     「t 是过期时间戳」。实际上 `t` 恒等于 2 —— 那是个标志位，不是
     时间戳。于是 `now - 86400 < 2 < now + 86400` 永远不成立，判断
     永远落空，**永远走兜底值**。连带后果是诊断页里显示的「直链余命」
@@ -985,7 +998,7 @@ def _cas_link_dead(key, url):
     """
     缓存里的这条直链**现在**还能不能真的取到数据。
 
-    【v2.2.10 重要更正】以前这里有两个要命的设计：
+    【v2.2.11 重要更正】以前这里有两个要命的设计：
       1. 60 秒节流：同一个片子最多 60 秒探一次。省下的那点时间，
          代价是这 60 秒窗口里链坏了照样往外发 —— 302 直连下播放器
          一旦拿到链就钉死，服务端事后无法补救。
@@ -1027,7 +1040,7 @@ def _fresh_link_broken(key, url, cas_name=""):
     """
     刚签发的直链是不是根本用不了。
 
-    【v2.2.10 更正 —— 这是整场排查的落点】
+    【v2.2.11 更正 —— 这是整场排查的落点】
     这里以前是无条件相信探测结果：探不到就删掉重还原。在海外服务器上
     这是个灾难 —— 服务器跨国际线路去看国内 CDN，探测经常探不到，
     于是一个播放请求就删文件、重还原一份，播放器一路转圈。
@@ -1329,7 +1342,11 @@ def _proxy_stream(file_id, cfg, cas_name, use_cas):
     import requests as _rq
 
     resume = _is_resume(file_id)
-    url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas, resume)
+    set_request_deadline(PLAY_REQUEST_DEADLINE)
+    try:
+        url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas, resume)
+    finally:
+        clear_request_deadline()
     if url is None:
         return err
     _mark_served(file_id)
@@ -1414,7 +1431,13 @@ def direct_link(file_id):
         if len(_last_seen) > 2000:
             _last_seen.clear()
     resume = _is_resume(file_id)
-    url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas, resume)
+    # 给这次请求套一个总时限：再慢也不会「加载到天荒地老」，
+    # 最坏是等一会儿快速失败，用户重试时状态已热、秒开。
+    set_request_deadline(PLAY_REQUEST_DEADLINE)
+    try:
+        url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas, resume)
+    finally:
+        clear_request_deadline()
     if url is None:
         _diag_add(ok=False, name=cas_name or file_id[:12], cas=use_cas,
                   ms=int((time.time() - t0) * 1000), resume=resume,
@@ -1860,8 +1883,54 @@ def api_schedule_now_removed():
     }), 410
 
 
+# ----------------------------------------------------------------------
+# 后台保温：别让「冷启动」落到用户头上
+# ----------------------------------------------------------------------
+#
+# 一次冷启动续播要**串行**打 9 个云盘接口来回（取 client、读 .cas 内容、
+# 列临时目录、秒传创建、取直链……）。国内本地部署 1.6 秒就跑完，感觉不到；
+# 但服务器在海外（甲骨文）跨国际线路访问国内接口时，这几秒会明显放大 ——
+# 而这几秒**全部**加在用户点下播放到画面出来之间。
+#
+# 用户实测：本地最快 4 秒出画面，甲骨文至少 8 秒以上。差的这几秒，
+# 很大一部分就是冷启动的接口往返。
+#
+# 这个线程每几分钟在后台替用户把这些「热」一遍：
+#   * 云盘 client 的 token 快到期时，在后台重建（而不是在用户播放时重建）；
+#   * 临时目录 ID 顺手确认一下。
+# 于是用户第一次播放也走在热路径上。
+KEEP_WARM_INTERVAL = 240     # 后台保温间隔（秒）
+_warm_started = False
+
+
+def _keep_warm_loop():
+    while True:
+        try:
+            time.sleep(KEEP_WARM_INTERVAL)
+            cfg = load_config()
+            if not cfg.get("authorization"):
+                continue
+            client = get_client(cfg)          # 过期了就在后台重建
+            if cfg.get("cas_enabled", True):
+                get_restorer(cfg, client).ensure_temp_dir()
+        except Exception as exc:
+            app.logger.info("后台保温跳过一轮（忽略）: %s", exc)
+
+
+def start_keep_warm():
+    """启动后台保温线程（只起一次）。"""
+    global _warm_started
+    with _clients_lock:
+        if _warm_started:
+            return
+        _warm_started = True
+    threading.Thread(target=_keep_warm_loop, name="139strm-keep-warm",
+                     daemon=True).start()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8025))
     threading.Thread(target=_task_scheduler_loop, name="139strm-task-scheduler",
                      daemon=True).start()
+    start_keep_warm()
     app.run(host="0.0.0.0", port=port, threaded=True)
