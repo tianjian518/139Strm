@@ -54,7 +54,7 @@ CAS_LINK_MAX_TTL = 4 * 60
 CAS_TEMP_GRACE = 120
 # 缓存里的直链多久探一次（秒）。
 #
-# 【v2.2.16】v2.2.9 曾把它废成 0（每次请求都探），理由是「这 60 秒里链坏了
+# 【v2.2.17】v2.2.9 曾把它废成 0（每次请求都探），理由是「这 60 秒里链坏了
 # 照样往外发」。用户的甲骨文诊断数据推翻了那个决定：热路径上只剩探测一步
 # 却要 4.8 秒 —— 说明**在海外服务器上探测本身很贵**。每次播放都白等几秒，
 # 代价远超它防住的那点风险。恢复 60 秒节流（这也是 v2.2.2 生产验证过的值）。
@@ -89,7 +89,7 @@ PLAY_REQUEST_DEADLINE = 25
 # ----------------------------------------------------------------------
 # 探测熔断：防止「探不到 → 判链死刑 → 重建」演变成还原风暴
 # ----------------------------------------------------------------------
-# 【v2.2.16 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
+# 【v2.2.17 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
 #
 # 事情是这样的：交链前探测直链，是 v2.2.3 才加进来的。v2.2.2 及以前
 # 交链前**完全不探测**，而那一版在生产上跑了很久、从没出过问题。
@@ -249,7 +249,7 @@ _clients = {}
 _clients_lock = threading.Lock()
 # 建 client（含 init 的两次接口往返）单独串行。
 #
-# 【v2.2.16】以前 init 在锁外调用，浏览器并发发两条播放请求时，
+# 【v2.2.17】以前 init 在锁外调用，浏览器并发发两条播放请求时，
 # **两边都会各 init 一遍** —— 白扔两次跨国际线路的往返。用户诊断里
 # 那两条重叠的请求（9.5 秒 + 4.8 秒）就有这个成分：第二条进来时
 # 第一条还在建连接，于是它也建了一遍。
@@ -849,7 +849,7 @@ def api_strm_status():
 def _amz_deadline(url):
     """从预签名直链里读出**真正的**过期时刻（unix 秒）；读不到返回 None。
 
-    实测（v2.2.16）：139 给的是对象存储的预签名 URL，形如
+    实测（v2.2.17）：139 给的是对象存储的预签名 URL，形如
         https://<bucket>.eos.<region>.cmecloud.cn/<obj>
             ?X-Amz-Algorithm=AWS4-HMAC-SHA256
             &X-Amz-Date=20260910T012236Z      ← 签发时刻（UTC）
@@ -875,7 +875,7 @@ def _amz_deadline(url):
 def _link_expire(url, default_ttl, max_ttl=None):
     """按直链自己的过期时间来决定缓存多久。
 
-    【v2.2.16 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
+    【v2.2.17 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
     「t 是过期时间戳」。实际上 `t` 恒等于 2 —— 那是个标志位，不是
     时间戳。于是 `now - 86400 < 2 < now + 86400` 永远不成立，判断
     永远落空，**永远走兜底值**。连带后果是诊断页里显示的「直链余命」
@@ -975,7 +975,7 @@ def _probe_status():
 
 # 探测专用连接池。
 #
-# 【v2.2.16 关键优化】以前探测用的是 requests.get()，**每次都新建一条连接** ——
+# 【v2.2.17 关键优化】以前探测用的是 requests.get()，**每次都新建一条连接** ——
 # 新建连接要 TCP 握手 + TLS 握手，一共 3 个来回。本地感觉不到（一个来回
 # 0.5 毫秒），但服务器在海外、一个来回几百毫秒到一两秒时，光是"重新握手"
 # 就要好几秒 —— 而这笔钱每次探测都要重付一遍。
@@ -1078,7 +1078,7 @@ def _cas_link_dead(key, url):
     """
     缓存里的这条直链**现在**还能不能真的取到数据。
 
-    【v2.2.16 —— 数据驱动的回退】
+    【v2.2.17 —— 数据驱动的回退】
     v2.2.9 我把这里的「60 秒节流」去掉了，理由是「这 60 秒窗口里链坏了
     照样往外发」。当时我以为探测很便宜（本地实测 0.2 秒）。
     用户从甲骨文发回来的诊断数据推翻了这个前提：
@@ -1127,7 +1127,7 @@ def _fresh_link_broken(key, url, cas_name=""):
     """
     刚签发的直链是不是根本用不了。
 
-    【v2.2.16 更正 —— 这是整场排查的落点】
+    【v2.2.17 更正 —— 这是整场排查的落点】
     这里以前是无条件相信探测结果：探不到就删掉重还原。在海外服务器上
     这是个灾难 —— 服务器跨国际线路去看国内 CDN，探测经常探不到，
     于是一个播放请求就删文件、重还原一份，播放器一路转圈。
@@ -1185,7 +1185,7 @@ _last_served_lock = threading.Lock()
 # 每个片子**每一次**来请求的时刻（不管成没成）。用来算「距上次请求隔了多久」——
 # 这是判断「这次是续播还是播放中的 seek」最直接的证据。
 #
-# 【v2.2.16】这份记录**落盘**。
+# 【v2.2.17】这份记录**落盘**。
 # 起因：用户升级（重建容器）后马上播第 135 集，服务端却判成了「新播」——
 # 因为它重启后内存里空空如也，以为这部片子从没播过。而判续播的唯一依据
 # 就是这个时间戳，它一丢，续播判定就整个失效。
@@ -1279,7 +1279,7 @@ def _mark_served(file_id):
 def _is_resume(file_id, gap=None):
     """这次请求是不是「播到一半退出去、过了一阵子回来接着播」。
 
-    【v2.2.16 —— 用户实测纠正】
+    【v2.2.17 —— 用户实测纠正】
     以前这里是「Range 起点必须大于 0」**且**「距上次交链超过 180 秒」，
     两个条件都要满足。用户拿真实数据证明这个判据是坏的：
 
@@ -1715,17 +1715,73 @@ def direct_link(file_id):
 _DIAG_MAX = 40
 _diag = collections.deque(maxlen=_DIAG_MAX)
 _diag_lock = threading.Lock()
+# 【v2.2.17】诊断记录**落盘**。
+# 用户反馈：升级（重建容器）后之前的记录全没了，想跟升级前对比都做不到。
+# 记录只放内存里就是这个下场 —— 而"升级前后对比"恰恰是排查这类问题时
+# 最有用东西。落盘后可以跨重启保留。
+_diag_file = ""
+_diag_loaded = False
+_diag_saved_at = 0.0
+DIAG_SAVE_MIN_GAP = 10         # 最多 10 秒写一次盘
+
+
+def _diag_path():
+    p = _state_path()
+    return p.replace("play_state.json", "diag_log.json") if p else ""
+
+
+def _diag_load():
+    global _diag_loaded, _diag_file
+    if _diag_loaded:
+        return
+    _diag_loaded = True
+    _diag_file = _diag_path()
+    if not _diag_file or not os.path.exists(_diag_file):
+        return
+    try:
+        with open(_diag_file, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        for item in (raw.get("items") or [])[-_DIAG_MAX:]:
+            if isinstance(item, dict):
+                _diag.append(item)
+        if len(_diag):
+            app.logger.info("已恢复 %d 条历史播放诊断记录", len(_diag))
+    except Exception as exc:
+        app.logger.info("读取播放诊断失败（忽略）: %s", exc)
+
+
+def _diag_save(force=False):
+    global _diag_saved_at
+    path = _diag_file or _diag_path()
+    if not path:
+        return
+    now = time.time()
+    if not force and now - _diag_saved_at < DIAG_SAVE_MIN_GAP:
+        return
+    _diag_saved_at = now
+    try:
+        with _diag_lock:
+            items = list(_diag)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"items": items}, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as exc:
+        app.logger.info("写入播放诊断失败（忽略）: %s", exc)
 
 
 def _diag_add(**kw):
     kw["t"] = time.strftime("%m-%d %H:%M:%S")
+    _diag_load()
     with _diag_lock:
         _diag.append(kw)
+    _diag_save()
 
 
 @app.route("/api/diag")
 def api_diag():
     """最近 40 次播放请求：成功/失败、耗时、交出去的直链还剩多久。"""
+    _diag_load()          # 重启后第一次打开面板时把历史记录读回来
     with _diag_lock:
         items = list(_diag)[::-1]
     return jsonify({"ok": True, "items": items})
@@ -1735,6 +1791,7 @@ def api_diag():
 def api_diag_clear():
     with _diag_lock:
         _diag.clear()
+    _diag_save(force=True)      # 清空也要落盘，否则重启后"清掉的"又回来了
     return jsonify({"ok": True})
 
 
@@ -2200,7 +2257,7 @@ def _warm_cdn():
 
 
 def _keep_warm_loop():
-    # 【v2.2.16】启动后**立刻**热一遍，不等第一个间隔。
+    # 【v2.2.17】启动后**立刻**热一遍，不等第一个间隔。
     # 用户实测：容器刚重建时点播放要 8.4 秒，跑了一会儿之后只要 5.3 秒 ——
     # 差的 3 秒全是"从零建连接"。而保温线程原来要等 240 秒才第一次跑，
     # 正好把用户升级后第一次播放晾在最冷的时刻。
