@@ -22,7 +22,7 @@ from flask import Flask, jsonify, render_template, request, redirect, Response
 from yun139 import crypto
 from yun139.client import (Yun139Client, Yun139Error, CLOUD_TYPES,
                            set_request_deadline, clear_request_deadline,
-                           count_reset, count_snapshot)
+                           count_reset, count_snapshot, count_add)
 from yun139.strm import (StrmGenerator, DEFAULT_MEDIA_EXT, DEFAULT_COPY_EXT,
                          sanitize_name, CancelError)
 from yun139 import cas as cas_mod
@@ -54,7 +54,7 @@ CAS_LINK_MAX_TTL = 4 * 60
 CAS_TEMP_GRACE = 120
 # 缓存里的直链多久探一次（秒）。
 #
-# 【v2.2.15】v2.2.9 曾把它废成 0（每次请求都探），理由是「这 60 秒里链坏了
+# 【v2.2.16】v2.2.9 曾把它废成 0（每次请求都探），理由是「这 60 秒里链坏了
 # 照样往外发」。用户的甲骨文诊断数据推翻了那个决定：热路径上只剩探测一步
 # 却要 4.8 秒 —— 说明**在海外服务器上探测本身很贵**。每次播放都白等几秒，
 # 代价远超它防住的那点风险。恢复 60 秒节流（这也是 v2.2.2 生产验证过的值）。
@@ -89,7 +89,7 @@ PLAY_REQUEST_DEADLINE = 25
 # ----------------------------------------------------------------------
 # 探测熔断：防止「探不到 → 判链死刑 → 重建」演变成还原风暴
 # ----------------------------------------------------------------------
-# 【v2.2.15 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
+# 【v2.2.16 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
 #
 # 事情是这样的：交链前探测直链，是 v2.2.3 才加进来的。v2.2.2 及以前
 # 交链前**完全不探测**，而那一版在生产上跑了很久、从没出过问题。
@@ -249,7 +249,7 @@ _clients = {}
 _clients_lock = threading.Lock()
 # 建 client（含 init 的两次接口往返）单独串行。
 #
-# 【v2.2.15】以前 init 在锁外调用，浏览器并发发两条播放请求时，
+# 【v2.2.16】以前 init 在锁外调用，浏览器并发发两条播放请求时，
 # **两边都会各 init 一遍** —— 白扔两次跨国际线路的往返。用户诊断里
 # 那两条重叠的请求（9.5 秒 + 4.8 秒）就有这个成分：第二条进来时
 # 第一条还在建连接，于是它也建了一遍。
@@ -849,7 +849,7 @@ def api_strm_status():
 def _amz_deadline(url):
     """从预签名直链里读出**真正的**过期时刻（unix 秒）；读不到返回 None。
 
-    实测（v2.2.15）：139 给的是对象存储的预签名 URL，形如
+    实测（v2.2.16）：139 给的是对象存储的预签名 URL，形如
         https://<bucket>.eos.<region>.cmecloud.cn/<obj>
             ?X-Amz-Algorithm=AWS4-HMAC-SHA256
             &X-Amz-Date=20260910T012236Z      ← 签发时刻（UTC）
@@ -875,7 +875,7 @@ def _amz_deadline(url):
 def _link_expire(url, default_ttl, max_ttl=None):
     """按直链自己的过期时间来决定缓存多久。
 
-    【v2.2.15 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
+    【v2.2.16 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
     「t 是过期时间戳」。实际上 `t` 恒等于 2 —— 那是个标志位，不是
     时间戳。于是 `now - 86400 < 2 < now + 86400` 永远不成立，判断
     永远落空，**永远走兜底值**。连带后果是诊断页里显示的「直链余命」
@@ -975,7 +975,7 @@ def _probe_status():
 
 # 探测专用连接池。
 #
-# 【v2.2.15 关键优化】以前探测用的是 requests.get()，**每次都新建一条连接** ——
+# 【v2.2.16 关键优化】以前探测用的是 requests.get()，**每次都新建一条连接** ——
 # 新建连接要 TCP 握手 + TLS 握手，一共 3 个来回。本地感觉不到（一个来回
 # 0.5 毫秒），但服务器在海外、一个来回几百毫秒到一两秒时，光是"重新握手"
 # 就要好几秒 —— 而这笔钱每次探测都要重付一遍。
@@ -1045,8 +1045,10 @@ def _probe_link(url, timeout=5):
         resp = _get_probe_session().get(
             url, headers={"Range": "bytes=0-0"}, timeout=timeout, stream=True)
     except Exception:
+        count_add((time.time() - t0) * 1000)
         _note_probe_fail()
         return PROBE_UNKNOWN
+    count_add((time.time() - t0) * 1000)   # 探测也是一次往返，计入统计
     _note_probe_latency(int((time.time() - t0) * 1000))
     _note_probe_ok()
     code = resp.status_code
@@ -1076,7 +1078,7 @@ def _cas_link_dead(key, url):
     """
     缓存里的这条直链**现在**还能不能真的取到数据。
 
-    【v2.2.15 —— 数据驱动的回退】
+    【v2.2.16 —— 数据驱动的回退】
     v2.2.9 我把这里的「60 秒节流」去掉了，理由是「这 60 秒窗口里链坏了
     照样往外发」。当时我以为探测很便宜（本地实测 0.2 秒）。
     用户从甲骨文发回来的诊断数据推翻了这个前提：
@@ -1125,7 +1127,7 @@ def _fresh_link_broken(key, url, cas_name=""):
     """
     刚签发的直链是不是根本用不了。
 
-    【v2.2.15 更正 —— 这是整场排查的落点】
+    【v2.2.16 更正 —— 这是整场排查的落点】
     这里以前是无条件相信探测结果：探不到就删掉重还原。在海外服务器上
     这是个灾难 —— 服务器跨国际线路去看国内 CDN，探测经常探不到，
     于是一个播放请求就删文件、重还原一份，播放器一路转圈。
@@ -1181,10 +1183,80 @@ RESUME_IDLE_GAP = 180      # 距上次来要链超过这么久，又带非零 Ra
 _last_served = {}          # file_id -> 上次成功交链的时刻
 _last_served_lock = threading.Lock()
 # 每个片子**每一次**来请求的时刻（不管成没成）。用来算「距上次请求隔了多久」——
-# 这是判断「这次是续播还是播放中的 seek」最直接的证据，也是排查
-# 「隔夜续播一直加载中」时最关键的一个数字。
+# 这是判断「这次是续播还是播放中的 seek」最直接的证据。
+#
+# 【v2.2.16】这份记录**落盘**。
+# 起因：用户升级（重建容器）后马上播第 135 集，服务端却判成了「新播」——
+# 因为它重启后内存里空空如也，以为这部片子从没播过。而判续播的唯一依据
+# 就是这个时间戳，它一丢，续播判定就整个失效。
+# 落盘后，重启、升级镜像都不再影响判断。
 _last_seen = {}
 _last_seen_lock = threading.Lock()
+_last_seen_file = ""           # 懒初始化，见 _state_path()
+_last_seen_loaded = False
+_last_seen_saved_at = 0.0
+LAST_SEEN_SAVE_MIN_GAP = 15    # 最多 15 秒写一次盘，别让磁盘成为负担
+LAST_SEEN_KEEP = 2000          # 只留最近这么多条
+LAST_SEEN_TTL = 30 * 24 * 3600  # 超过 30 天的记录没意义，加载时丢掉
+
+
+def _state_path():
+    """播放状态（上次访问时刻）落盘位置：跟 config.json 放一起，跟着配置卷走。"""
+    cfg = os.environ.get("CONFIG_PATH") or ""
+    if not cfg:
+        return ""
+    d = os.path.dirname(os.path.abspath(cfg))
+    return os.path.join(d, "play_state.json") if d else ""
+
+
+def _load_last_seen():
+    global _last_seen_loaded, _last_seen_file
+    if _last_seen_loaded:
+        return
+    _last_seen_loaded = True
+    _last_seen_file = _state_path()
+    if not _last_seen_file or not os.path.exists(_last_seen_file):
+        return
+    try:
+        with open(_last_seen_file, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except Exception as exc:
+        app.logger.info("读取播放状态失败（忽略）: %s", exc)
+        return
+    now = time.time()
+    n = 0
+    for fid, ts in (raw.get("last_seen") or {}).items():
+        try:
+            ts = float(ts)
+        except Exception:
+            continue
+        if now - ts < LAST_SEEN_TTL:
+            _last_seen[fid] = ts
+            n += 1
+    if n:
+        app.logger.info("已恢复 %d 条播放记录（重启后仍能认出「续播」）", n)
+
+
+def _save_last_seen(force=False):
+    """把播放记录写回磁盘（节流 + 原子写，失败不影响播放）。"""
+    global _last_seen_saved_at
+    path = _last_seen_file or _state_path()
+    if not path:
+        return
+    now = time.time()
+    if not force and now - _last_seen_saved_at < LAST_SEEN_SAVE_MIN_GAP:
+        return
+    _last_seen_saved_at = now
+    try:
+        with _last_seen_lock:
+            items = sorted(_last_seen.items(), key=lambda kv: kv[1],
+                           reverse=True)[:LAST_SEEN_KEEP]
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"last_seen": dict(items)}, fh)
+        os.replace(tmp, path)
+    except Exception as exc:
+        app.logger.info("写入播放状态失败（忽略）: %s", exc)
 
 
 def _range_start():
@@ -1207,7 +1279,7 @@ def _mark_served(file_id):
 def _is_resume(file_id, gap=None):
     """这次请求是不是「播到一半退出去、过了一阵子回来接着播」。
 
-    【v2.2.15 —— 用户实测纠正】
+    【v2.2.16 —— 用户实测纠正】
     以前这里是「Range 起点必须大于 0」**且**「距上次交链超过 180 秒」，
     两个条件都要满足。用户拿真实数据证明这个判据是坏的：
 
@@ -1497,10 +1569,12 @@ def _proxy_stream(file_id, cfg, cas_name, use_cas):
     """
     import requests as _rq
 
+    _load_last_seen()
     with _last_seen_lock:
         _prev = _last_seen.get(file_id)
         gap = int(time.time() - _prev) if _prev else 0
         _last_seen[file_id] = time.time()
+    _save_last_seen()
     resume = _is_resume(file_id, gap)
     set_request_deadline(PLAY_REQUEST_DEADLINE)
     try:
@@ -1585,13 +1659,18 @@ def direct_link(file_id):
     # 服务端自己就记着。
     rng_raw = request.headers.get("Range") or ""
     ua_raw = request.headers.get("User-Agent") or ""
+    _load_last_seen()          # 重启后第一次请求时把播放记录读回来
     with _last_seen_lock:
         _prev = _last_seen.get(file_id)
         gap = int(time.time() - _prev) if _prev else 0
         _last_seen[file_id] = time.time()
-        if len(_last_seen) > 2000:
+        if len(_last_seen) > LAST_SEEN_KEEP:
+            # 只留最近的一批，别让表无限长
+            keep = sorted(_last_seen.items(), key=lambda kv: kv[1],
+                          reverse=True)[:LAST_SEEN_KEEP]
             _last_seen.clear()
-            _last_seen[file_id] = time.time()
+            _last_seen.update(keep)
+    _save_last_seen()          # 节流落盘：重启后仍认得出「续播」
     resume = _is_resume(file_id, gap)
     # 给这次请求套一个总时限：再慢也不会「加载到天荒地老」，
     # 最坏是等一会儿快速失败，用户重试时状态已热、秒开。
@@ -2121,9 +2200,16 @@ def _warm_cdn():
 
 
 def _keep_warm_loop():
+    # 【v2.2.16】启动后**立刻**热一遍，不等第一个间隔。
+    # 用户实测：容器刚重建时点播放要 8.4 秒，跑了一会儿之后只要 5.3 秒 ——
+    # 差的 3 秒全是"从零建连接"。而保温线程原来要等 240 秒才第一次跑，
+    # 正好把用户升级后第一次播放晾在最冷的时刻。
+    first = True
     while True:
         try:
-            time.sleep(KEEP_WARM_INTERVAL)
+            if not first:
+                time.sleep(KEEP_WARM_INTERVAL)
+            first = False
             cfg = load_config()
             if not cfg.get("authorization"):
                 continue

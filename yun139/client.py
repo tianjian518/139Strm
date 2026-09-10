@@ -39,6 +39,21 @@ def count_snapshot():
     return getattr(_counters, "n", 0), getattr(_counters, "ms", 0)
 
 
+def count_add(ms):
+    """手工记一笔。
+
+    探测直链走的是**独立的连接池**（不经过 client 的请求守卫），
+    所以它那一次往返不会自动计入。不补上的话，诊断里
+    「总耗时 - 来回耗时」会凭空多出一大截，看着像是本地处理很慢，
+    其实全是探测 —— 那会把排查带偏。
+    """
+    try:
+        _counters.n = getattr(_counters, "n", 0) + 1
+        _counters.ms = getattr(_counters, "ms", 0) + int(ms)
+    except Exception:
+        pass
+
+
 def set_request_deadline(seconds):
     """给当前线程设一个云盘接口总时限（秒）；0 = 不限制。
 
@@ -101,7 +116,7 @@ class Yun139Client:
                  mail_cookies="", username="", cloud_id="", timeout=(6, 12)):
         """timeout 默认 (连接 6 秒, 读取 12 秒)。
 
-        【v2.2.15 重要修复】以前这里是 30 —— 单次接口调用最多能挂 30 秒。
+        【v2.2.16 重要修复】以前这里是 30 —— 单次接口调用最多能挂 30 秒。
         而一次冷启动续播要跟云盘打 9 个来回，只要有两次撞上线路抖动，
         用户就要干等 60 秒以上，播放器全程转圈（用户原话：「加载 1 分钟
         都不播放」）。国内本地部署感觉不到，海外服务器（甲骨文）跨国际
