@@ -50,7 +50,7 @@ LINK_TTL = 2 * 3600  # 直链有时效，缓存 2 小时
 CAS_LINK_MAX_TTL = 4 * 60
 # 直链缓存失效后，临时文件再多留一会儿（防止最后一波 Range 请求打空）
 CAS_TEMP_GRACE = 120
-# 【v2.2.9 已废除】CAS_PROBE_INTERVAL 曾经是「缓存期内最多 60 秒探一次」的
+# 【v2.2.10 已废除】CAS_PROBE_INTERVAL 曾经是「缓存期内最多 60 秒探一次」的
 # 节流。实测下来这个节流得不偿失：省下的那点探测开销，代价是这 60 秒窗口里
 # 链坏了照样往外发，而 302 直连下播放器一旦拿到链就钉死、服务端事后无法补救。
 # 现在改成**每次交链都真探**，一次只要 0.2 秒。留着这个名字只为让老配置和
@@ -67,21 +67,34 @@ _probe_suspect = {}
 # 而用户「返回播放」时回源正好完成，于是秒开 —— 这就是那个
 # 「时好时坏、什么间隔都可能撞上」的偶发问题。
 # 宁可开播慢两三秒，也别把一条还没就绪的链交给播放器。
-CAS_LINK_VERIFY_TIMEOUT = 4      # 第一次探测超时（秒）
-CAS_LINK_VERIFY_RETRY_TIMEOUT = 2  # 复探超时（秒）—— 短一些，别让用户干等
+CAS_LINK_VERIFY_TIMEOUT = 2      # 第一次探测超时（秒）
+CAS_LINK_VERIFY_RETRY_TIMEOUT = 1.5  # 复探超时（秒）
 CAS_VERIFY_BACKOFF = 1.2         # 探不清时退避多久再探一次
 
 # ----------------------------------------------------------------------
 # 探测熔断：防止「探不到 → 判链死刑 → 重建」演变成还原风暴
 # ----------------------------------------------------------------------
-# 场景：服务器到 CDN 的路突然不通（Oracle Cloud 到国内 CDN 偶尔会这样）。
-# 这时候每一次探测都是超时 —— 但那不代表**链坏了**，只代表**我们探不到**。
-# 如果照着「探不到就重建」办，播放器每来一次请求就秒传还原一份，
-# 一分钟能还原七八次、临时目录堆几十 GB（v2.1.8 真实踩过的坑）。
-# 所以：连续多次「根本没探成」就熔断，熔断期内不再因为探不到而判链死刑。
-PROBE_BREAKER_THRESHOLD = 8      # 连续这么多次「探不成」就熔断
-PROBE_BREAKER_SECONDS = 300      # 熔断持续多久
-_probe_fail_streak = 0
+# 【v2.2.10 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
+#
+# 事情是这样的：交链前探测直链，是 v2.2.3 才加进来的。v2.2.2 及以前
+# 交链前**完全不探测**，而那一版在生产上跑了很久、从没出过问题。
+#
+# 为什么探测会变成灾难：探测是**服务器自己**发起的，而服务器在甲骨文
+# （海外），要跨国际线路去访问移动云盘的国内 CDN。国内家庭宽带/本地
+# 虚拟机探一次 0.2 秒，海外服务器却可能很慢、甚至被拒。
+#
+# 而 v2.2.3 之后把「探测没探成」也当成了「链坏了」，于是：
+#   每个播放请求 → 探测失败 → 判定链坏 → 删掉刚还原的文件、重新秒传
+#   → 再探测又失败…… 一轮好几秒到十几秒，播放器一直转圈。
+# 等用户「返回重播」，状态热了、或者熔断生效了，就又能播 —— 完全对上
+# 「续播一直加载中、返回重播才行」。
+#
+# 铁律：**刚还原出来的新链不可能是坏的**（文件刚建、签名刚签发）。
+# 连着几条新链都被判坏，那问题一定在探测方，不在链。
+PROBE_BREAKER_THRESHOLD = 3      # 连续这么多次「新链被判坏」就熔断
+PROBE_BREAKER_SECONDS = 600      # 熔断持续多久
+_probe_fail_streak = 0           # 连续「根本没探成」（超时/网络异常）
+_dead_streak = 0                 # 连续「刚还原的新链被判坏」
 _probe_fail_until = 0
 # 「删掉重还原」的补救多久之内不重复做（秒）。万一 CDN 压根不接受 Range
 # 探测（每条链都回 4xx），没有这个冷却就会每次换链都白搭一次秒传，
@@ -805,7 +818,7 @@ def api_strm_status():
 def _amz_deadline(url):
     """从预签名直链里读出**真正的**过期时刻（unix 秒）；读不到返回 None。
 
-    实测（v2.2.9）：139 给的是对象存储的预签名 URL，形如
+    实测（v2.2.10）：139 给的是对象存储的预签名 URL，形如
         https://<bucket>.eos.<region>.cmecloud.cn/<obj>
             ?X-Amz-Algorithm=AWS4-HMAC-SHA256
             &X-Amz-Date=20260910T012236Z      ← 签发时刻（UTC）
@@ -831,7 +844,7 @@ def _amz_deadline(url):
 def _link_expire(url, default_ttl, max_ttl=None):
     """按直链自己的过期时间来决定缓存多久。
 
-    【v2.2.9 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
+    【v2.2.10 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
     「t 是过期时间戳」。实际上 `t` 恒等于 2 —— 那是个标志位，不是
     时间戳。于是 `now - 86400 < 2 < now + 86400` 永远不成立，判断
     永远落空，**永远走兜底值**。连带后果是诊断页里显示的「直链余命」
@@ -875,23 +888,56 @@ def _note_probe_fail():
     """探测「根本没探成」（超时/网络异常）记一笔；连续太多次就熔断。"""
     global _probe_fail_streak, _probe_fail_until
     _probe_fail_streak += 1
-    if _probe_fail_streak >= PROBE_BREAKER_THRESHOLD:
+    if _probe_fail_streak >= PROBE_BREAKER_THRESHOLD * 2:
         _probe_fail_until = time.time() + PROBE_BREAKER_SECONDS
         _probe_fail_streak = 0
         app.logger.warning(
-            "连续 %d 次探测都没探成，判定为「探测不可用」并熔断 %d 秒 —— "
+            "连续多次探测都没探成，判定为「探测不可用」并熔断 %d 秒 —— "
             "这段时间内不再因为探不到而判链死刑",
-            PROBE_BREAKER_THRESHOLD, PROBE_BREAKER_SECONDS)
+            PROBE_BREAKER_SECONDS)
 
 
 def _note_probe_ok():
-    global _probe_fail_streak
+    global _probe_fail_streak, _dead_streak
     _probe_fail_streak = 0
+    _dead_streak = 0
+
+
+def _note_fresh_dead(cas_name=""):
+    """刚还原出来的新链被判坏了 —— 数一数，连着几次就熔断。
+
+    铁律：刚还原出来的链**不可能是坏的**。连着几条都被判坏，那问题在
+    探测方（服务器到 CDN 的路），不在链。这时候还照「判坏 → 删掉重还原」
+    办，就是每来一个请求还原一份 —— 播放器一路转圈。
+
+    返回 True 表示熔断刚刚触发（调用方应当放弃这次重建）。
+    """
+    global _dead_streak, _probe_fail_until
+    _dead_streak += 1
+    if _dead_streak >= PROBE_BREAKER_THRESHOLD:
+        _probe_fail_until = time.time() + PROBE_BREAKER_SECONDS
+        _dead_streak = 0
+        app.logger.warning(
+            "连续 %d 条**刚还原出来的**新链都被判成坏链 —— 这不可能是链的问题，"
+            "是这台服务器看不到 CDN。判定探测不可用，熔断 %d 秒，"
+            "期间照常把链接交给播放器（最后一条：%s）",
+            PROBE_BREAKER_THRESHOLD, PROBE_BREAKER_SECONDS, cas_name)
+        return True
+    return False
 
 
 def _probe_usable():
     """探测这件事本身还靠不靠得住（熔断器没跳闸）。"""
     return time.time() >= _probe_fail_until
+
+
+def _probe_status():
+    """给自检接口用：探测功能现在是什么状态。"""
+    left = int(_probe_fail_until - time.time())
+    return {"usable": _probe_usable(),
+            "breaker_left": max(left, 0),
+            "fail_streak": _probe_fail_streak,
+            "dead_streak": _dead_streak}
 
 
 def _probe_link(url, timeout=5):
@@ -939,7 +985,7 @@ def _cas_link_dead(key, url):
     """
     缓存里的这条直链**现在**还能不能真的取到数据。
 
-    【v2.2.9 重要更正】以前这里有两个要命的设计：
+    【v2.2.10 重要更正】以前这里有两个要命的设计：
       1. 60 秒节流：同一个片子最多 60 秒探一次。省下的那点时间，
          代价是这 60 秒窗口里链坏了照样往外发 —— 302 直连下播放器
          一旦拿到链就钉死，服务端事后无法补救。
@@ -957,14 +1003,12 @@ def _cas_link_dead(key, url):
     return True
 
 
-def _link_ready(url, tries=2):
+def _link_ready(url, tries=1):
     """这条链现在能不能真的取到数据 —— 必须探到「活着」才算数。
 
-    连探两次、任意一次拿到字节就算活，不是强迫症：CDN 边缘节点偶尔
-    会对一条**好链**抖一下（超时 / 5xx），一次判死会让好链被白白丢掉、
-    多跑一次秒传。反过来，坏链的应答要么是快速 4xx（实测 0.06 秒），
-    要么是干脆不回 —— 两种都不会因为多探一次而变好。
-    第二次用更短的超时，避免坏链把用户的开播等待拖成十几秒。
+    默认只探一次。以前默认探两次是为了防 CDN 抖动误判，但两次超时叠起来
+    最坏能到 8 秒，全加在用户的开播等待上 —— 这本身就是「一直加载中」的
+    一个成因。现在单次超时也压到 2 秒，最坏 2 秒。
 
     熔断期内一律返回 True：那是「我们探不到」，不是「链坏了」，
     绝不能拿它去判死刑（否则就是还原风暴）。
@@ -979,21 +1023,28 @@ def _link_ready(url, tries=2):
     return False
 
 
-def _fresh_link_broken(key, url):
+def _fresh_link_broken(key, url, cas_name=""):
     """
     刚签发的直链是不是根本用不了。
 
-    为什么非要在交出去之前验一次：播放器 follow 302 之后就**钉死在这条
-    URL 上**了，服务端后面再怎么重建、换链它都不知道，只能等用户退出去
-    重播 —— 那就是「偶尔一直加载中」的全部成因。
+    【v2.2.10 更正 —— 这是整场排查的落点】
+    这里以前是无条件相信探测结果：探不到就删掉重还原。在海外服务器上
+    这是个灾难 —— 服务器跨国际线路去看国内 CDN，探测经常探不到，
+    于是一个播放请求就删文件、重还原一份，播放器一路转圈。
+    现在加一道闸：**连着几条刚还原的新链都被判坏，就认定是探测方的
+    问题**（新链不可能是坏的），熔断探测，照常把链接交出去。
 
-    【v2.2.9 更正】以前这里写的是「连续两次明确 4xx 才判废」，也就是
-    「探不清（超时/5xx）算活」。这条规则漏掉的正好是转圈那一种：
-    链挂死不响应时，探测只会超时 —— 于是被判成「活」，照样交出去。
-    现在统一用 _link_ready：**拿不到字节就不算活**。
+    为什么非要在交出去之前验一次：播放器 follow 302 之后就**钉死在这条
+    URL 上**了，服务端后面再怎么重建、换链它都不知道。
     """
     _probe_at[key] = time.time()        # 刚探过，记一笔
-    return not _link_ready(url)
+    if not _probe_usable():
+        return False
+    if _link_ready(url):
+        _note_probe_ok()
+        return False
+    # 探不到 / 判坏：先记一笔「新链被判坏」，够数就熔断，熔断后不再重建
+    return not _note_fresh_dead(cas_name)
 
 
 def _verify_retry_allowed(key):
@@ -1169,8 +1220,8 @@ def _get_cas_link(client, cfg, file_id, cas_name, resume=False):
             return url
 
     url, size, temp_id, real_name, restored = restorer.fetch_link(file_id, cas_name)
-    # 注意 and 的短路：只有确实探到坏链才会消耗掉那一次补救机会
-    if _fresh_link_broken(key, url) and _verify_retry_allowed(key):
+    # 注意 and 的短路：只有确实探到坏链、且熔断器没跳闸，才会走补救
+    if _fresh_link_broken(key, url, cas_name) and _verify_retry_allowed(key):
         # 这条链根本用不了：新还原的文件在 CDN 侧还没同步，或者复用的实体
         # 其实已经不在了（取直链接口对不存在的文件照样签发 URL，不探一下
         # 就会把死链发给播放器 —— 表现是「一直加载中，返回重播才正常」）。
@@ -1417,6 +1468,82 @@ def api_diag_clear():
     with _diag_lock:
         _diag.clear()
     return jsonify({"ok": True})
+
+
+@app.route("/api/selftest")
+def api_selftest():
+    """网络自检：这台服务器**自己**能不能顺利用上云盘 CDN，以及有多快。
+
+    为什么要单独测这个：交链前的探测是**服务器自己**发起的，而服务器
+    可能在海外（甲骨文），要跨国际线路去看移动云盘的国内 CDN。
+    国内本地部署探一次 0.2 秒，海外服务器却可能很慢甚至被拒 —— 而
+    探测一旦被当成「链坏了」，就会演变成「来一个请求还原一份」，
+    播放器一路转圈。
+
+    这个接口把事实量出来：到 CDN 的 TCP 连接耗时、探测结论、探测耗时、
+    以及服务器自己的出口 IP。部署在哪、线路好不好，一看便知。
+    """
+    import socket
+    from urllib.parse import urlparse
+
+    out = {"ok": True, "probe": _probe_status(), "egress_ip": None,
+           "cdn": None, "note": ""}
+
+    # 服务器出口 IP（几个公共服务依次试，都拿不到就算了，不影响结论）
+    for u in ("https://api.ipify.org", "https://ifconfig.me/ip",
+              "https://ipinfo.io/ip"):
+        try:
+            import requests
+            r = requests.get(u, timeout=6)
+            if r.status_code == 200 and r.text.strip():
+                out["egress_ip"] = r.text.strip()[:64]
+                break
+        except Exception:
+            continue
+
+    # 拿一条最近用过的直链来测
+    url = ""
+    with _cache_lock:
+        for v in _link_cache.values():
+            if v and isinstance(v[0], str) and v[0].startswith("http"):
+                url = v[0]
+                break
+    if not url:
+        out["note"] = ("还没有可测的直链（先随便播一个视频，再回来点自检）。"
+                       "出口 IP 和探测状态仍然有效。")
+        return jsonify(out)
+
+    host = urlparse(url).netloc.split(":")[0]
+    cdn = {"host": host}
+    # 1) 纯 TCP 连接耗时：区分「线路慢」和「链坏」
+    t0 = time.time()
+    try:
+        s = socket.create_connection((host, 443), timeout=6)
+        s.close()
+        cdn["tcp_ms"] = int((time.time() - t0) * 1000)
+    except Exception as exc:
+        cdn["tcp_ms"] = None
+        cdn["tcp_error"] = f"{type(exc).__name__}: {exc}"[:120]
+    # 2) 真正探一次这条链
+    t0 = time.time()
+    verdict = _probe_link(url, CAS_LINK_VERIFY_TIMEOUT)
+    cdn["probe_ms"] = int((time.time() - t0) * 1000)
+    cdn["probe_verdict"] = verdict
+    cdn["life_s"] = int(_link_expire(url, LINK_TTL, CAS_LINK_MAX_TTL) - time.time())
+    out["cdn"] = cdn
+
+    # 3) 给一句人话结论
+    if verdict == PROBE_ALIVE and (cdn.get("tcp_ms") or 9999) < 1500:
+        out["note"] = "这台服务器到云盘 CDN 的线路正常，交链前探测是可靠的。"
+    elif verdict == PROBE_ALIVE:
+        out["note"] = (f"探测能成功，但到 CDN 的 TCP 连接要 "
+                       f"{cdn.get('tcp_ms')} 毫秒，偏慢 —— 每次播放都会多等这么久。")
+    else:
+        out["note"] = ("⚠️ 这台服务器**探不到**云盘 CDN。这说明服务器所在网络"
+                       "访问国内 CDN 有问题（海外服务器很常见）。此时绝不能"
+                       "把探测失败当成「链坏了」，否则会不断删文件重还原 ——"
+                       "熔断器会自动接管，照常把链接交给播放器。")
+    return jsonify(out)
 
 
 @app.route("/api/link/<path:file_id>")

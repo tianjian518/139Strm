@@ -159,7 +159,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
       <div class="nav-item" data-page="settings">⚙️ 系统设置</div>
     </nav>
     <div class="sidebar-foot">
-      <div class="ver">v2.2.9 · 移动云盘直连</div>
+      <div class="ver">v2.2.10 · 移动云盘直连</div>
       <div class="exit-btn" onclick="alert('退出现在没有特殊作用，关闭浏览器即可。')">↩ 退出</div>
     </div>
   </aside>
@@ -306,11 +306,13 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
         <div class="card-title">🩺 播放诊断 <span class="sub">最近 40 次播放请求</span></div>
         <div class="hint">偶发「一直加载中」时，先看这里：<b>红色=服务端没能给出直链</b>（会写明原因）；绿色的「直链余命」是交出去时这条链还剩多少秒可用。<b>🔁续播</b> 表示这次被识别成「接着上次进度回来」，服务端已按全新播放重来（丢弃旧直链和旧秒传会话）；<b>🆕新播</b> 表示从头播。</div>
         <div id="diagBox" style="margin-top:8px;font-size:12px;line-height:1.9;max-height:240px;overflow:auto">加载中…</div>
-        <div style="display:flex;gap:8px;margin-top:8px">
+        <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
           <button class="btn sec" onclick="loadDiag()">刷新</button>
           <button class="btn sec" onclick="copyDiag(event)">复制诊断</button>
+          <button class="btn sec" onclick="runSelftest(event)">网络自检</button>
           <button class="btn sec" onclick="clearDiag()">清空记录</button>
         </div>
+        <div id="selftestBox" style="margin-top:8px;font-size:12px;line-height:1.9"></div>
       </div>
 
       <div class="card">
@@ -733,6 +735,28 @@ async function copyDiag(ev){
 }
 async function clearDiag(){
   await fetch('/api/diag/clear',{method:'POST'}); loadDiag()
+}
+async function runSelftest(ev){
+  const box = $('selftestBox'); if(!box) return
+  const btn = ev && ev.target
+  if (btn) btn.textContent = '检测中…'
+  box.innerHTML = '正在检测…'
+  let j
+  try { j = await fetch('/api/selftest').then(r=>r.json()) } catch(e){
+    box.textContent = '自检失败'; if (btn) btn.textContent='网络自检'; return
+  }
+  if (btn) btn.textContent = '网络自检'
+  const p = j.probe || {}
+  const c = j.cdn || {}
+  const okColor = v => v ? '#16a34a' : '#dc2626'
+  box.innerHTML = `
+    <div>服务器出口 IP：<b>${j.egress_ip || '取不到'}</b></div>
+    ${c.host ? `<div>云盘 CDN：<span class="mono">${c.host}</span></div>` : ''}
+    ${c.tcp_ms != null ? `<div>到 CDN 的 TCP 连接：<b>${c.tcp_ms} 毫秒</b></div>` : ''}
+    ${c.tcp_error ? `<div style="color:#dc2626">连不上 CDN：${c.tcp_error}</div>` : ''}
+    ${c.probe_verdict ? `<div>探测结论：<b style="color:${c.probe_verdict==='alive'?'#16a34a':'#dc2626'}">${c.probe_verdict}</b>（耗时 ${c.probe_ms} 毫秒，链余命 ${c.life_s} 秒）</div>` : ''}
+    <div>探测功能：<b style="color:${okColor(p.usable)}">${p.usable?'可用':'已熔断（'+p.breaker_left+' 秒后恢复）'}</b></div>
+    <div style="margin-top:6px;padding:6px 8px;border-radius:6px;background:rgba(128,128,128,.12)">${j.note||''}</div>`
 }
 async function loadStorage(){
   let j
