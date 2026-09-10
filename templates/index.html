@@ -159,7 +159,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
       <div class="nav-item" data-page="settings">⚙️ 系统设置</div>
     </nav>
     <div class="sidebar-foot">
-      <div class="ver">v2.2.14 · 移动云盘直连</div>
+      <div class="ver">v2.2.15 · 移动云盘直连</div>
       <div class="exit-btn" onclick="alert('退出现在没有特殊作用，关闭浏览器即可。')">↩ 退出</div>
     </div>
   </aside>
@@ -304,7 +304,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
 
       <div class="card">
         <div class="card-title">🩺 播放诊断 <span class="sub">最近 40 次播放请求</span></div>
-        <div class="hint">偶发「一直加载中」时，先看这里：<b>红色=服务端没能给出直链</b>（会写明原因）；绿色的「直链余命」是交出去时这条链还剩多少秒可用。<b>🔁续播</b> 表示这次被识别成「接着上次进度回来」，服务端已按全新播放重来（丢弃旧直链和旧秒传会话）；<b>🆕新播</b> 表示从头播。</div>
+        <div class="hint">偶发「一直加载中」时，先看这里：<b>红色=服务端没能给出直链</b>（会写明原因）；绿色的「直链余命」是交出去时这条链还剩多少秒可用。<b>🔁续播</b> 表示这次被识别成「接着上次进度回来」，服务端已按全新播放重来；<b>🆕新播</b> 表示从头播。<b style="color:#b45309">☁ N 个来回</b> 是这次跟云盘打了几次网络往返 —— 服务器在海外时，慢不慢几乎全由这个数字决定。</div>
         <div id="diagBox" style="margin-top:8px;font-size:12px;line-height:1.9;max-height:240px;overflow:auto">加载中…</div>
         <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
           <button class="btn sec" onclick="loadDiag()">刷新</button>
@@ -696,6 +696,9 @@ async function loadDiag(){
     const info = it.ok
       ? `耗时 ${it.ms}ms · 直链余命 ${it.life}s${it.cas?' · CAS秒传':''}`
       : `❌ ${(it.err||'未知原因').replace(/</g,'&lt;')}`
+    // 跟云盘打了几个来回 —— 服务器在海外时，慢不慢几乎全由这个数字决定
+    const calls = (typeof it.calls === 'number' && it.calls > 0)
+      ? `<span style="color:#b45309">☁ ${it.calls} 个来回 / ${it.call_ms}ms</span>` : ''
     // 播放器发过来的原始 Range：卡住时这是最关键的一条证据
     const rng = it.rng
       ? `<span style="color:#7c3aed">Range: ${String(it.rng).replace(/</g,'&lt;')}</span>`
@@ -707,7 +710,7 @@ async function loadDiag(){
       · ${tag}
       <b>${(it.name||'').replace(/</g,'&lt;').slice(0,24)}</b>
       <span style="opacity:.75">${info}</span>
-      <div style="padding-left:14px;font-size:11px">${rng} ${gap}
+      <div style="padding-left:14px;font-size:11px">${rng} ${gap} ${calls}
         <span style="opacity:.45">${(it.ua||'').replace(/</g,'&lt;')}</span></div></div>`
   }).join('')
 }
@@ -721,6 +724,7 @@ async function copyDiag(ev){
     parts.push(it.ok ? `成功 耗时${it.ms}ms 余命${it.life}s` : `失败 ${it.err||''}`)
     parts.push(`Range=${it.rng||'(无)'}`)
     if (it.gap) parts.push(`距上次${it.gap}s`)
+    if (it.calls) parts.push(`来回${it.calls}个/${it.call_ms}ms`)
     if (it.ua) parts.push(it.ua)
     return parts.join(' | ')
   })
@@ -757,6 +761,7 @@ async function runSelftest(ev){
     ${c.probe_verdict ? `<div>探测结论：<b style="color:${c.probe_verdict==='alive'?'#16a34a':'#dc2626'}">${c.probe_verdict}</b>（耗时 ${c.probe_ms} 毫秒，链余命 ${c.life_s} 秒）</div>` : ''}
     ${(p.recent_ms&&p.recent_ms.length) ? `<div>最近几次探测耗时：<span class="mono">${p.recent_ms.join(' / ')} 毫秒</span>${p.slow_pause_left?` <b style="color:#dc2626">（太慢，已暂停探测 ${p.slow_pause_left} 秒）</b>`:''}</div>` : ''}
     <div>探测功能：<b style="color:${okColor(p.usable)}">${p.usable?'可用':'已暂停（'+Math.max(p.breaker_left,p.slow_pause_left||0)+' 秒后恢复）'}</b></div>
+    ${(j.cas_cache&&!j.cas_cache.error) ? `<div>.cas 解析缓存：<span class="mono">${j.cas_cache.path}</span> ${j.cas_cache.writable?'<b style="color:#16a34a">可写</b>':'<b style="color:#dc2626">不可写</b>'} · 已存 ${j.cas_cache.entries} 条 ${j.cas_cache.exists?'':'<b style="color:#dc2626">（文件不存在，重启后会重新读云盘）</b>'}</div>` : ''}
     <div style="margin-top:6px;padding:6px 8px;border-radius:6px;background:rgba(128,128,128,.12)">${j.note||''}</div>`
 }
 async function loadStorage(){

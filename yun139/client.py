@@ -23,6 +23,20 @@ from . import crypto
 # 用 thread-local 而不是实例属性：client 是按账号缓存、多线程共用的，
 # 把时限挂在实例上会被别的请求串改。
 _deadline = threading.local()
+# 当前线程「跟云盘打了几个来回、共花了多久」。给播放诊断用 ——
+# 服务器在海外时，一次播放慢不慢几乎完全由"打了几个来回"决定，
+# 所以这个数字比总耗时更能说明问题。
+_counters = threading.local()
+
+
+def count_reset():
+    _counters.n = 0
+    _counters.ms = 0
+
+
+def count_snapshot():
+    """返回 (来回次数, 合计毫秒)。"""
+    return getattr(_counters, "n", 0), getattr(_counters, "ms", 0)
 
 
 def set_request_deadline(seconds):
@@ -87,7 +101,7 @@ class Yun139Client:
                  mail_cookies="", username="", cloud_id="", timeout=(6, 12)):
         """timeout 默认 (连接 6 秒, 读取 12 秒)。
 
-        【v2.2.14 重要修复】以前这里是 30 —— 单次接口调用最多能挂 30 秒。
+        【v2.2.15 重要修复】以前这里是 30 —— 单次接口调用最多能挂 30 秒。
         而一次冷启动续播要跟云盘打 9 个来回，只要有两次撞上线路抖动，
         用户就要干等 60 秒以上，播放器全程转圈（用户原话：「加载 1 分钟
         都不播放」）。国内本地部署感觉不到，海外服务器（甲骨文）跨国际
@@ -133,7 +147,17 @@ class Yun139Client:
                     "云盘接口响应太慢，已超过本次播放的等待上限 —— "
                     "请重试（重试会快很多）")
             kw.setdefault("timeout", client.timeout)
-            return raw_request(method, url, **kw)
+            t0 = time.time()
+            try:
+                return raw_request(method, url, **kw)
+            finally:
+                # 记一笔：这次播放一共跟云盘打了几个来回、花了多久
+                try:
+                    _counters.n = getattr(_counters, "n", 0) + 1
+                    _counters.ms = (getattr(_counters, "ms", 0)
+                                    + int((time.time() - t0) * 1000))
+                except Exception:
+                    pass
 
         self._session.request = _guarded
 
