@@ -57,9 +57,15 @@ _probe_at = {}
 # 「说不清」名单：某条链上一次探测拿到了 200 却没交待任何长度信息。
 # 一次可能是 CDN 正在给刚还原的文件回源，连续两次才敢判死。
 _probe_suspect = {}
-# 直链交到播放器之前先自己拉 1 个字节验一次，超时就当没探成（不重试）。
-# 用比常规探测更短的超时，别让校验本身把「点下一集」拖慢。
-CAS_LINK_VERIFY_TIMEOUT = 3
+# 直链交到播放器之前先自己拉 1 个字节验一次。
+# 注意：这里的语义不只是「验活」，更是**替播放器把 CDN 回源这趟等完** ——
+# 秒传还原出来的文件在 CDN 上是冷的，1GB+ 的文件回源常常要好几秒，
+# 播放器第一脚踩下去就得干等，等不及就是「一直加载中」；
+# 而用户「返回播放」时回源正好完成，于是秒开 —— 这就是那个
+# 「时好时坏、什么间隔都可能撞上」的偶发问题。
+# 宁可开播慢两三秒，也别把一条还没就绪的链交给播放器。
+CAS_LINK_VERIFY_TIMEOUT = 4      # 单次探测超时（秒）
+CAS_VERIFY_BACKOFF = 1.2         # 探不清时退避多久再探一次
 # 「删掉重还原」的补救多久之内不重复做（秒）。万一 CDN 压根不接受 Range
 # 探测（每条链都回 4xx），没有这个冷却就会每次换链都白搭一次秒传，
 # 换集直接慢一倍 —— 真遇到这种情况，认赔一次比一直赔划算。
@@ -895,8 +901,22 @@ def _fresh_link_broken(key, url):
     趟了一遍；真废了的链才会两遍都 4xx。
     """
     _probe_at[key] = time.time()        # 刚探过，60 秒内别再重复探它
-    return (_probe_link(url, CAS_LINK_VERIFY_TIMEOUT) == PROBE_DEAD
-            and _probe_link(url, CAS_LINK_VERIFY_TIMEOUT) == PROBE_DEAD)
+    # 探两遍：第一遍探不清（超时/5xx/说不清）时**等一会儿再探**，
+    # 给 CDN 把回源走完 —— 探成了再交链，播放器就不会撞上回源等待。
+    # 只有连续两次明确 4xx 才敢判这条链废了。
+    for attempt in (1, 2):
+        verdict = _probe_link(url, CAS_LINK_VERIFY_TIMEOUT)
+        if verdict == PROBE_ALIVE:
+            return False                       # 回源已完成，链可以用
+        if verdict == PROBE_DEAD and attempt == 2:
+            return True                        # 连续两次 4xx，确实废了
+        if attempt == 1:
+            app.logger.info("直链首探未就绪（%s），等待 CDN 回源后复探",
+                            "4xx" if verdict == PROBE_DEAD else "超时/说不清")
+            time.sleep(CAS_VERIFY_BACKOFF)
+    # 两遍都没探清：不敢判坏（可能是 CDN 不接受 Range 探测），
+    # 但已经替播放器等过一轮回源了
+    return False
 
 
 def _verify_retry_allowed(key):
