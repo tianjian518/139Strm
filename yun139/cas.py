@@ -81,7 +81,7 @@ MAX_SESSION_TTL = SESSION_TTL
 # 临时目录的概率可以忽略；真删了，秒传会失败并触发强制重查（见
 # _create_in_temp_dir），不会卡死。
 #
-# 【v2.2.12】60 秒 → 600 秒。这台服务器可能在海外，每次 list 根目录
+# 【v2.2.13】60 秒 → 600 秒。这台服务器可能在海外，每次 list 根目录
 # 都要跨国际线路走一趟；而「用户恰好在 10 分钟内删掉临时目录」这种事
 # 概率极低，且真发生了也有兜底（秒传失败 → 强制重查重试），不会卡死。
 DIR_CHECK_INTERVAL = 600
@@ -284,6 +284,8 @@ class CASRestorer:
         self._dir_checked_at = 0.0
         # .cas 解析结果缓存：file_id -> (CASInfo, 时刻)，见 CAS_PARSE_CACHE_TTL
         self._cas_cache = {}
+        # 每个 .cas 的解析锁：并发请求只让第一个去读云盘，其余等结果
+        self._parse_locks = {}
         # 解析缓存落盘文件（跨重启/隔夜仍然有效），懒加载
         self._cas_cache_file = _cas_cache_path()
         self._cas_cache_loaded = False
@@ -309,28 +311,53 @@ class CASRestorer:
         能直接省掉这两次往返。同一个 file_id 的 .cas 内容不会变，
         缓存 6 小时安全（换链通常 15 分钟一次）。
 
-        【v2.2.12】缓存改为**落盘**：以前只在内存里，容器一重启或隔夜
+        【v2.2.13】缓存改为**落盘**：以前只在内存里，容器一重启或隔夜
         就全没了，续播又要重新付这两次往返 —— 而服务器如果在海外，
         这两次就是好几秒。这两秒是纯浪费，因为它取的东西永远不变。
+
+        【v2.2.13】加**按文件的解析锁**：以前这里是 check-then-act，
+        浏览器并发发两条播放请求时两边都查不到缓存、于是**各读一遍云盘**
+        —— 又是两次往返白扔。用户诊断里那两条重叠的请求（9.5s + 4.8s），
+        第二条本来只该花几百毫秒，结果把第一遍的活又干了一遍。
         """
-        now = time.time()
         self._ensure_cas_cache_loaded()
         with self._state_lock:
             hit = self._cas_cache.get(file_id)
-        if hit and now - hit[1] < CAS_PARSE_CACHE_TTL:
+        if hit and time.time() - hit[1] < CAS_PARSE_CACHE_TTL:
             return copy.copy(hit[0])
-        url = self.client.get_download_url(file_id)
-        resp = self.client._session.get(url, timeout=self.client.timeout)
-        resp.raise_for_status()
-        info = decode(resp.content)
-        with self._state_lock:
-            self._cas_cache[file_id] = (info, now)
-            if len(self._cas_cache) > CAS_PARSE_CACHE_MAX:
-                for k in sorted(self._cas_cache, key=lambda x: self._cas_cache[x][1])[
-                        :len(self._cas_cache) // 4]:
-                    self._cas_cache.pop(k, None)
+
+        with self._parse_lock_for(file_id):
+            # 拿到锁再查一次：可能刚才那条并发请求已经读好了
+            now = time.time()
+            with self._state_lock:
+                hit = self._cas_cache.get(file_id)
+            if hit and now - hit[1] < CAS_PARSE_CACHE_TTL:
+                return copy.copy(hit[0])
+            url = self.client.get_download_url(file_id)
+            resp = self.client._session.get(url, timeout=self.client.timeout)
+            resp.raise_for_status()
+            info = decode(resp.content)
+            with self._state_lock:
+                self._cas_cache[file_id] = (info, now)
+                if len(self._cas_cache) > CAS_PARSE_CACHE_MAX:
+                    for k in sorted(
+                            self._cas_cache,
+                            key=lambda x: self._cas_cache[x][1]
+                    )[:len(self._cas_cache) // 4]:
+                        self._cas_cache.pop(k, None)
         self._save_cas_cache()
         return info
+
+    def _parse_lock_for(self, file_id):
+        """取（必要时创建）某个 .cas 的解析锁。"""
+        with self._state_lock:
+            lk = self._parse_locks.get(file_id)
+            if lk is None:
+                lk = threading.Lock()
+                if len(self._parse_locks) > 500:
+                    self._parse_locks.clear()
+                self._parse_locks[file_id] = lk
+            return lk
 
     # ------------------------------------------------------------------
     # 解析缓存落盘

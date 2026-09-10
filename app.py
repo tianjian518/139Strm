@@ -53,7 +53,7 @@ CAS_LINK_MAX_TTL = 4 * 60
 CAS_TEMP_GRACE = 120
 # 缓存里的直链多久探一次（秒）。
 #
-# 【v2.2.12】v2.2.9 曾把它废成 0（每次请求都探），理由是「这 60 秒里链坏了
+# 【v2.2.13】v2.2.9 曾把它废成 0（每次请求都探），理由是「这 60 秒里链坏了
 # 照样往外发」。用户的甲骨文诊断数据推翻了那个决定：热路径上只剩探测一步
 # 却要 4.8 秒 —— 说明**在海外服务器上探测本身很贵**。每次播放都白等几秒，
 # 代价远超它防住的那点风险。恢复 60 秒节流（这也是 v2.2.2 生产验证过的值）。
@@ -88,7 +88,7 @@ PLAY_REQUEST_DEADLINE = 25
 # ----------------------------------------------------------------------
 # 探测熔断：防止「探不到 → 判链死刑 → 重建」演变成还原风暴
 # ----------------------------------------------------------------------
-# 【v2.2.12 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
+# 【v2.2.13 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
 #
 # 事情是这样的：交链前探测直链，是 v2.2.3 才加进来的。v2.2.2 及以前
 # 交链前**完全不探测**，而那一版在生产上跑了很久、从没出过问题。
@@ -246,6 +246,13 @@ def build_client(cfg=None):
 # 缓存 client 后命中请求 0 次 init 往返，连接也可复用。
 _clients = {}
 _clients_lock = threading.Lock()
+# 建 client（含 init 的两次接口往返）单独串行。
+#
+# 【v2.2.13】以前 init 在锁外调用，浏览器并发发两条播放请求时，
+# **两边都会各 init 一遍** —— 白扔两次跨国际线路的往返。用户诊断里
+# 那两条重叠的请求（9.5 秒 + 4.8 秒）就有这个成分：第二条进来时
+# 第一条还在建连接，于是它也建了一遍。
+_clients_init_lock = threading.Lock()
 _CLIENT_TTL = 3600          # 定期重建，给 refresh_token 留出续期机会
 
 
@@ -266,13 +273,20 @@ def get_client(cfg):
         entry = _clients.get(key)
         if entry and now - entry[1] < _CLIENT_TTL:
             return entry[0]
-    client = build_client(cfg)
-    client.init()
-    with _clients_lock:
-        _clients[key] = (client, time.time())
-        for k in [k for k in _clients if k != key]:   # 只留当前账号
-            _clients.pop(k, None)
-    return client
+    # 需要（重新）初始化：串起来做，并再查一次 —— 并发请求里只有第一个
+    # 真正去 init，其余的等它出结果后直接用，不重复付那两次往返。
+    with _clients_init_lock:
+        with _clients_lock:
+            entry = _clients.get(key)
+            if entry and time.time() - entry[1] < _CLIENT_TTL:
+                return entry[0]
+        client = build_client(cfg)
+        client.init()
+        with _clients_lock:
+            _clients[key] = (client, time.time())
+            for k in [k for k in _clients if k != key]:   # 只留当前账号
+                _clients.pop(k, None)
+        return client
 
 
 def drop_client(cfg):
@@ -834,7 +848,7 @@ def api_strm_status():
 def _amz_deadline(url):
     """从预签名直链里读出**真正的**过期时刻（unix 秒）；读不到返回 None。
 
-    实测（v2.2.12）：139 给的是对象存储的预签名 URL，形如
+    实测（v2.2.13）：139 给的是对象存储的预签名 URL，形如
         https://<bucket>.eos.<region>.cmecloud.cn/<obj>
             ?X-Amz-Algorithm=AWS4-HMAC-SHA256
             &X-Amz-Date=20260910T012236Z      ← 签发时刻（UTC）
@@ -860,7 +874,7 @@ def _amz_deadline(url):
 def _link_expire(url, default_ttl, max_ttl=None):
     """按直链自己的过期时间来决定缓存多久。
 
-    【v2.2.12 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
+    【v2.2.13 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
     「t 是过期时间戳」。实际上 `t` 恒等于 2 —— 那是个标志位，不是
     时间戳。于是 `now - 86400 < 2 < now + 86400` 永远不成立，判断
     永远落空，**永远走兜底值**。连带后果是诊断页里显示的「直链余命」
@@ -960,7 +974,7 @@ def _probe_status():
 
 # 探测专用连接池。
 #
-# 【v2.2.12 关键优化】以前探测用的是 requests.get()，**每次都新建一条连接** ——
+# 【v2.2.13 关键优化】以前探测用的是 requests.get()，**每次都新建一条连接** ——
 # 新建连接要 TCP 握手 + TLS 握手，一共 3 个来回。本地感觉不到（一个来回
 # 0.5 毫秒），但服务器在海外、一个来回几百毫秒到一两秒时，光是"重新握手"
 # 就要好几秒 —— 而这笔钱每次探测都要重付一遍。
@@ -1061,7 +1075,7 @@ def _cas_link_dead(key, url):
     """
     缓存里的这条直链**现在**还能不能真的取到数据。
 
-    【v2.2.12 —— 数据驱动的回退】
+    【v2.2.13 —— 数据驱动的回退】
     v2.2.9 我把这里的「60 秒节流」去掉了，理由是「这 60 秒窗口里链坏了
     照样往外发」。当时我以为探测很便宜（本地实测 0.2 秒）。
     用户从甲骨文发回来的诊断数据推翻了这个前提：
@@ -1110,7 +1124,7 @@ def _fresh_link_broken(key, url, cas_name=""):
     """
     刚签发的直链是不是根本用不了。
 
-    【v2.2.12 更正 —— 这是整场排查的落点】
+    【v2.2.13 更正 —— 这是整场排查的落点】
     这里以前是无条件相信探测结果：探不到就删掉重还原。在海外服务器上
     这是个灾难 —— 服务器跨国际线路去看国内 CDN，探测经常探不到，
     于是一个播放请求就删文件、重还原一份，播放器一路转圈。
@@ -1233,7 +1247,40 @@ def _get_link(client, file_id, resume=False):
     return url
 
 
+# ----------------------------------------------------------------------
+# 同一部片子的并发播放请求串行化
+# ----------------------------------------------------------------------
+#
+# 浏览器播一个视频会**同时**发好几条请求（用户诊断里就抓到了两条重叠的：
+# 一条 9.5 秒、一条 4.8 秒）。这两条会各自去取一遍直链、各自探测一遍 ——
+# 而第二条本来只该花几百毫秒：等第一条把结果放进缓存，直接拿来用就行。
+#
+# 在海外服务器上这不是小事：每次「取直链 + 探测」都是跨国际线路的往返，
+# 重复一遍就是白等一两秒。所以这里按片子排队 —— 第一条干活，其余的
+# 等它完成，然后命中缓存秒回。
+_play_locks = {}
+_play_locks_lock = threading.Lock()
+
+
+def _play_lock(key):
+    """取（必要时创建）某部片子的播放锁。"""
+    with _play_locks_lock:
+        lk = _play_locks.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            if len(_play_locks) > 500:
+                _play_locks.clear()
+            _play_locks[key] = lk
+        return lk
+
+
 def _get_cas_link(client, cfg, file_id, cas_name, resume=False):
+    """取 .cas 的播放直链。同一部片子的并发请求在这里排队，不重复干活。"""
+    with _play_lock("cas:" + file_id):
+        return _get_cas_link_inner(client, cfg, file_id, cas_name, resume)
+
+
+def _get_cas_link_inner(client, cfg, file_id, cas_name, resume=False):
     """
     .cas 文件的播放直链：秒传还原出临时文件，再把临时文件的直链 302 给播放器。
 
