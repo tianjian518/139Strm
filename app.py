@@ -51,12 +51,13 @@ LINK_TTL = 2 * 3600  # 直链有时效，缓存 2 小时
 CAS_LINK_MAX_TTL = 4 * 60
 # 直链缓存失效后，临时文件再多留一会儿（防止最后一波 Range 请求打空）
 CAS_TEMP_GRACE = 120
-# 【v2.2.11 已废除】CAS_PROBE_INTERVAL 曾经是「缓存期内最多 60 秒探一次」的
-# 节流。实测下来这个节流得不偿失：省下的那点探测开销，代价是这 60 秒窗口里
-# 链坏了照样往外发，而 302 直连下播放器一旦拿到链就钉死、服务端事后无法补救。
-# 现在改成**每次交链都真探**，一次只要 0.2 秒。留着这个名字只为让老配置和
-# 外部脚本不至于报错，代码里不再使用。
-CAS_PROBE_INTERVAL = 0
+# 缓存里的直链多久探一次（秒）。
+#
+# 【v2.2.12】v2.2.9 曾把它废成 0（每次请求都探），理由是「这 60 秒里链坏了
+# 照样往外发」。用户的甲骨文诊断数据推翻了那个决定：热路径上只剩探测一步
+# 却要 4.8 秒 —— 说明**在海外服务器上探测本身很贵**。每次播放都白等几秒，
+# 代价远超它防住的那点风险。恢复 60 秒节流（这也是 v2.2.2 生产验证过的值）。
+CAS_PROBE_INTERVAL = 60
 _probe_at = {}
 # 「说不清」名单：某条链上一次探测拿到了 200 却没交待任何长度信息。
 # 一次可能是 CDN 正在给刚还原的文件回源，连续两次才敢判死。
@@ -87,7 +88,7 @@ PLAY_REQUEST_DEADLINE = 25
 # ----------------------------------------------------------------------
 # 探测熔断：防止「探不到 → 判链死刑 → 重建」演变成还原风暴
 # ----------------------------------------------------------------------
-# 【v2.2.11 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
+# 【v2.2.12 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
 #
 # 事情是这样的：交链前探测直链，是 v2.2.3 才加进来的。v2.2.2 及以前
 # 交链前**完全不探测**，而那一版在生产上跑了很久、从没出过问题。
@@ -106,6 +107,8 @@ PLAY_REQUEST_DEADLINE = 25
 # 连着几条新链都被判坏，那问题一定在探测方，不在链。
 PROBE_BREAKER_THRESHOLD = 3      # 连续这么多次「新链被判坏」就熔断
 PROBE_BREAKER_SECONDS = 600      # 熔断持续多久
+# 探测本身太慢时，暂停探测多久（秒）。见 _probe_worth_doing()。
+PROBE_SLOW_PAUSE = 300
 _probe_fail_streak = 0           # 连续「根本没探成」（超时/网络异常）
 _dead_streak = 0                 # 连续「刚还原的新链被判坏」
 _probe_fail_until = 0
@@ -831,7 +834,7 @@ def api_strm_status():
 def _amz_deadline(url):
     """从预签名直链里读出**真正的**过期时刻（unix 秒）；读不到返回 None。
 
-    实测（v2.2.11）：139 给的是对象存储的预签名 URL，形如
+    实测（v2.2.12）：139 给的是对象存储的预签名 URL，形如
         https://<bucket>.eos.<region>.cmecloud.cn/<obj>
             ?X-Amz-Algorithm=AWS4-HMAC-SHA256
             &X-Amz-Date=20260910T012236Z      ← 签发时刻（UTC）
@@ -857,7 +860,7 @@ def _amz_deadline(url):
 def _link_expire(url, default_ttl, max_ttl=None):
     """按直链自己的过期时间来决定缓存多久。
 
-    【v2.2.11 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
+    【v2.2.12 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
     「t 是过期时间戳」。实际上 `t` 恒等于 2 —— 那是个标志位，不是
     时间戳。于是 `now - 86400 < 2 < now + 86400` 永远不成立，判断
     永远落空，**永远走兜底值**。连带后果是诊断页里显示的「直链余命」
@@ -940,17 +943,74 @@ def _note_fresh_dead(cas_name=""):
 
 
 def _probe_usable():
-    """探测这件事本身还靠不靠得住（熔断器没跳闸）。"""
-    return time.time() >= _probe_fail_until
+    """探测这件事本身还靠不靠得住（熔断器没跳闸、也没因为太慢而暂停）。"""
+    return time.time() >= _probe_fail_until and _probe_worth_doing()
 
 
 def _probe_status():
     """给自检接口用：探测功能现在是什么状态。"""
-    left = int(_probe_fail_until - time.time())
+    now = time.time()
     return {"usable": _probe_usable(),
-            "breaker_left": max(left, 0),
+            "breaker_left": max(int(_probe_fail_until - now), 0),
+            "slow_pause_left": max(int(_probe_slow_until - now), 0),
+            "recent_ms": list(_probe_ms_hist),
             "fail_streak": _probe_fail_streak,
             "dead_streak": _dead_streak}
+
+
+# 探测专用连接池。
+#
+# 【v2.2.12 关键优化】以前探测用的是 requests.get()，**每次都新建一条连接** ——
+# 新建连接要 TCP 握手 + TLS 握手，一共 3 个来回。本地感觉不到（一个来回
+# 0.5 毫秒），但服务器在海外、一个来回几百毫秒到一两秒时，光是"重新握手"
+# 就要好几秒 —— 而这笔钱每次探测都要重付一遍。
+#
+# 用户实测数据（甲骨文）：冷启动 9.5 秒；状态热了之后的第二次请求还要
+# 4.8 秒 —— 而热路径上只剩"探测"这一步（本来 0.2 秒的活），说明这几秒
+# 几乎全是「重新握手」。改成复用连接后，第一次探测付握手钱，之后每次
+# 都只花 1 个来回。
+_probe_session = None
+_probe_session_lock = threading.Lock()
+# 探测耗时（毫秒）的滑动记录，用来判断"探测本身值不值得做"
+_probe_ms_hist = collections.deque(maxlen=8)
+_probe_slow_until = 0            # 探测太慢时，这段时间内跳过探测
+
+
+def _get_probe_session():
+    """取探测用的持久连接（懒建，连接池 8 条）。"""
+    global _probe_session
+    with _probe_session_lock:
+        if _probe_session is None:
+            import requests
+            s = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=8, pool_maxsize=8, max_retries=0)
+            s.mount("https://", adapter)
+            s.mount("http://", adapter)
+            _probe_session = s
+        return _probe_session
+
+
+def _probe_worth_doing():
+    """探测这件事现在值不值得做。
+
+    如果服务器到 CDN 的一个来回就要好几秒，那"每次播放都先探一下"
+    的代价已经超过它带来的收益（它防的是"临时文件被删"这种少见情况）。
+    这时候就少探 —— 宁可偶尔交一条存疑的链，也别让用户每次都干等几秒。
+    """
+    return time.time() >= _probe_slow_until
+
+
+def _note_probe_latency(ms):
+    """记一次探测耗时；连续几次都很慢就暂停探测一阵子。"""
+    global _probe_slow_until
+    _probe_ms_hist.append(ms)
+    if len(_probe_ms_hist) >= 3 and all(x > 2500 for x in list(_probe_ms_hist)[-3:]):
+        _probe_slow_until = time.time() + PROBE_SLOW_PAUSE
+        _probe_ms_hist.clear()
+        app.logger.warning(
+            "探测本身连续三次都超过 2.5 秒（这台服务器到 CDN 太远），"
+            "暂停探测 %d 秒，期间直接复用缓存里的直链", PROBE_SLOW_PAUSE)
 
 
 def _probe_link(url, timeout=5):
@@ -958,18 +1018,21 @@ def _probe_link(url, timeout=5):
     对直链发一次 Range: bytes=0-0，看它还活不活。
 
     只取 1 个字节，且用 stream 避免把整个视频拉回来。
+    **走持久连接**（见 _probe_session）：省掉每次重新 TCP+TLS 握手的
+    两三个来回 —— 海外服务器上这一项就是好几秒。
 
     「探测自己没探成」（超时、网络异常）和「应答拿到了却说不清」
     是两回事，必须分开：前者是**探测侧**的问题（服务器到 CDN 的路不通），
     后者才是**链侧**的问题。这个区分是防还原风暴的关键。
     """
+    t0 = time.time()
     try:
-        import requests
-        resp = requests.get(url, headers={"Range": "bytes=0-0"},
-                            timeout=timeout, stream=True)
+        resp = _get_probe_session().get(
+            url, headers={"Range": "bytes=0-0"}, timeout=timeout, stream=True)
     except Exception:
         _note_probe_fail()
         return PROBE_UNKNOWN
+    _note_probe_latency(int((time.time() - t0) * 1000))
     _note_probe_ok()
     code = resp.status_code
     if 400 <= code < 500:
@@ -998,18 +1061,25 @@ def _cas_link_dead(key, url):
     """
     缓存里的这条直链**现在**还能不能真的取到数据。
 
-    【v2.2.11 重要更正】以前这里有两个要命的设计：
-      1. 60 秒节流：同一个片子最多 60 秒探一次。省下的那点时间，
-         代价是这 60 秒窗口里链坏了照样往外发 —— 302 直连下播放器
-         一旦拿到链就钉死，服务端事后无法补救。
-      2. 「探不清就判活」：探测超时/5xx/3xx 一律当活链交出去。
-         可「探不清」恰恰就是播放器**一直转圈**的那种状态 ——
-         链是挂死的，不是干脆报错的。把它当活链交出去，等于把
-         播放器钉在一条死链上，用户只能退出重播。
-    现在改成：每次交链都真探，且**必须探到「活着」才算活**。
-    实测一次探测只要 0.2 秒，代价远小于让用户对着转圈等。
+    【v2.2.12 —— 数据驱动的回退】
+    v2.2.9 我把这里的「60 秒节流」去掉了，理由是「这 60 秒窗口里链坏了
+    照样往外发」。当时我以为探测很便宜（本地实测 0.2 秒）。
+    用户从甲骨文发回来的诊断数据推翻了这个前提：
+
+        冷启动请求 9561ms；6 秒后、状态已热的第二次请求还要 4853ms ——
+        而热路径上只剩「探测」这一步。
+
+    也就是说，**在海外服务器上，一次探测要好几秒**（服务器到国内 CDN
+    的连接本身就很贵）。每次请求都探，等于每次播放都白等好几秒，
+    代价远远超过它防住的那点风险 —— 而且临时文件的寿命本来就比
+    直链缓存长，缓存还没到期时文件通常还在。
+    所以恢复节流：同一个片子最多 60 秒探一次。
+    真正重要、且一个链接只付一次的「新链探测」保留不动。
     """
-    _probe_at[key] = time.time()
+    now = time.time()
+    if now - _probe_at.get(key, 0) < CAS_PROBE_INTERVAL:
+        return False
+    _probe_at[key] = now
     if _link_ready(url):
         _probe_suspect.pop(key, None)
         return False
@@ -1040,7 +1110,7 @@ def _fresh_link_broken(key, url, cas_name=""):
     """
     刚签发的直链是不是根本用不了。
 
-    【v2.2.11 更正 —— 这是整场排查的落点】
+    【v2.2.12 更正 —— 这是整场排查的落点】
     这里以前是无条件相信探测结果：探不到就删掉重还原。在海外服务器上
     这是个灾难 —— 服务器跨国际线路去看国内 CDN，探测经常探不到，
     于是一个播放请求就删文件、重还原一份，播放器一路转圈。
@@ -1426,10 +1496,12 @@ def direct_link(file_id):
     rng_raw = request.headers.get("Range") or ""
     ua_raw = request.headers.get("User-Agent") or ""
     with _last_seen_lock:
-        gap = int(time.time() - _last_seen.get(file_id, 0))
+        _prev = _last_seen.get(file_id)
+        gap = int(time.time() - _prev) if _prev else 0
         _last_seen[file_id] = time.time()
         if len(_last_seen) > 2000:
             _last_seen.clear()
+            _last_seen[file_id] = time.time()
     resume = _is_resume(file_id)
     # 给这次请求套一个总时限：再慢也不会「加载到天荒地老」，
     # 最坏是等一会儿快速失败，用户重试时状态已热、秒开。

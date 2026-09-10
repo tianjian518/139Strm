@@ -159,7 +159,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
       <div class="nav-item" data-page="settings">⚙️ 系统设置</div>
     </nav>
     <div class="sidebar-foot">
-      <div class="ver">v2.2.11 · 移动云盘直连</div>
+      <div class="ver">v2.2.12 · 移动云盘直连</div>
       <div class="exit-btn" onclick="alert('退出现在没有特殊作用，关闭浏览器即可。')">↩ 退出</div>
     </div>
   </aside>
@@ -755,7 +755,8 @@ async function runSelftest(ev){
     ${c.tcp_ms != null ? `<div>到 CDN 的 TCP 连接：<b>${c.tcp_ms} 毫秒</b></div>` : ''}
     ${c.tcp_error ? `<div style="color:#dc2626">连不上 CDN：${c.tcp_error}</div>` : ''}
     ${c.probe_verdict ? `<div>探测结论：<b style="color:${c.probe_verdict==='alive'?'#16a34a':'#dc2626'}">${c.probe_verdict}</b>（耗时 ${c.probe_ms} 毫秒，链余命 ${c.life_s} 秒）</div>` : ''}
-    <div>探测功能：<b style="color:${okColor(p.usable)}">${p.usable?'可用':'已熔断（'+p.breaker_left+' 秒后恢复）'}</b></div>
+    ${(p.recent_ms&&p.recent_ms.length) ? `<div>最近几次探测耗时：<span class="mono">${p.recent_ms.join(' / ')} 毫秒</span>${p.slow_pause_left?` <b style="color:#dc2626">（太慢，已暂停探测 ${p.slow_pause_left} 秒）</b>`:''}</div>` : ''}
+    <div>探测功能：<b style="color:${okColor(p.usable)}">${p.usable?'可用':'已暂停（'+Math.max(p.breaker_left,p.slow_pause_left||0)+' 秒后恢复）'}</b></div>
     <div style="margin-top:6px;padding:6px 8px;border-radius:6px;background:rgba(128,128,128,.12)">${j.note||''}</div>`
 }
 async function loadStorage(){
