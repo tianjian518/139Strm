@@ -159,7 +159,7 @@ pre.log{background:#0f172a;color:#e2e8f0;padding:12px 14px;border-radius:8px;fon
       <div class="nav-item" data-page="settings">⚙️ 系统设置</div>
     </nav>
     <div class="sidebar-foot">
-      <div class="ver">v2.2.18 · 移动云盘直连</div>
+      <div class="ver">v2.2.19 · 移动云盘直连</div>
       <div class="exit-btn" onclick="alert('退出现在没有特殊作用，关闭浏览器即可。')">↩ 退出</div>
     </div>
   </aside>
@@ -710,12 +710,19 @@ async function loadDiag(){
     const nf = it.newfile === true
       ? '<b style="color:#dc2626">🔄换了新文件</b> '
       : (it.newfile === false ? '<span style="opacity:.5">复用文件</span> ' : '')
+    // 播放器要的位置 vs 文件实际大小。越界 = 「跳回起播点」的头号嫌疑：
+    // 播放器以为后面还有内容，其实文件已经到底了。
+    const sz = (typeof it.size === 'number' && it.size > 0)
+      ? `<span style="opacity:.6">文件 ${(it.size/1073741824).toFixed(2)}GB</span> ` : ''
+    const ov = it.oversize
+      ? `<b style="color:#dc2626">⚠️ 要的位置超出文件末尾（要 ${(it.want/1073741824).toFixed(2)}GB / 文件只有 ${(it.size/1073741824).toFixed(2)}GB）</b> `
+      : ''
     return `<div style="padding:4px 0;border-bottom:1px solid rgba(128,128,128,.15)">
       <span style="color:${color}">●</span> ${it.t}
       · ${tag}
       <b>${(it.name||'').replace(/</g,'&lt;').slice(0,24)}</b>
       <span style="opacity:.75">${info}</span>
-      <div style="padding-left:14px;font-size:11px">${rng} ${gap} ${calls} ${nf}
+      <div style="padding-left:14px;font-size:11px">${rng} ${gap} ${calls} ${nf}${sz}${ov}
         <span style="opacity:.45">${(it.ua||'').replace(/</g,'&lt;')}</span></div></div>`
   }).join('')
 }
@@ -732,6 +739,8 @@ async function copyDiag(ev){
     if (it.calls) parts.push(`来回${it.calls}个/${it.call_ms}ms`)
     if (it.newfile === true) parts.push('换了新文件')
     else if (it.newfile === false) parts.push('复用文件')
+    if (it.size) parts.push(`文件${(it.size/1073741824).toFixed(2)}GB`)
+    if (it.oversize) parts.push(`越界(要${(it.want/1073741824).toFixed(2)}GB/文件${(it.size/1073741824).toFixed(2)}GB)`)
     if (it.ua) parts.push(it.ua)
     return parts.join(' | ')
   })

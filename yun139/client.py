@@ -66,6 +66,25 @@ def set_request_deadline(seconds):
 def clear_request_deadline():
     _deadline.until = 0
 
+
+def _clamp_timeout(timeout, left):
+    """把单次调用的超时压到「本次请求还剩下的总时间」以内。
+
+    timeout 可能是 (连接, 读取) 元组，也可能是单个数字。
+    连接阶段同样要压：连接慢的时候也是这条线路慢，
+    不能连接按 6 秒等、读取再按剩下的时间等，叠起来照样超。
+    """
+    def clamp(x):
+        try:
+            x = float(x)
+        except Exception:
+            return x
+        return max(0.2, min(x, left))
+
+    if isinstance(timeout, (tuple, list)):
+        return tuple(clamp(t) for t in timeout)
+    return clamp(timeout)
+
 CLOUD_TYPES = ("personal_new", "personal", "family", "group")
 
 # 与官方 Web 端保持一致，避免被风控识别为异常客户端
@@ -116,7 +135,7 @@ class Yun139Client:
                  mail_cookies="", username="", cloud_id="", timeout=(6, 12)):
         """timeout 默认 (连接 6 秒, 读取 12 秒)。
 
-        【v2.2.18 重要修复】以前这里是 30 —— 单次接口调用最多能挂 30 秒。
+        【v2.2.19 重要修复】以前这里是 30 —— 单次接口调用最多能挂 30 秒。
         而一次冷启动续播要跟云盘打 9 个来回，只要有两次撞上线路抖动，
         用户就要干等 60 秒以上，播放器全程转圈（用户原话：「加载 1 分钟
         都不播放」）。国内本地部署感觉不到，海外服务器（甲骨文）跨国际
@@ -157,11 +176,23 @@ class Yun139Client:
 
         def _guarded(method, url, **kw):
             until = getattr(_deadline, "until", 0)
-            if until and time.time() > until:
+            now = time.time()
+            if until and now > until:
                 raise Yun139Error(
                     "云盘接口响应太慢，已超过本次播放的等待上限 —— "
                     "请重试（重试会快很多）")
+            # 单次调用的超时必须**跟着总时限收缩**。
+            #
+            # 【v2.2.19 修】原来这里只检查"总时限过了没有"，不收缩单次超时：
+            # 总时限还剩 3 秒时发起的那一次调用，照样按默认的 12 秒等着，
+            # 于是整个请求实际能拖到 25 + 12 ≈ 37 秒 —— 比承诺的 25 秒更久。
+            # 现在把本次超时压到"剩下的总时间"，总时限成了真正的硬上限。
             kw.setdefault("timeout", client.timeout)
+            if until:
+                left = until - now
+                if left < 0.2:
+                    left = 0.2
+                kw["timeout"] = _clamp_timeout(kw["timeout"], left)
             t0 = time.time()
             try:
                 return raw_request(method, url, **kw)
