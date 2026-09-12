@@ -62,7 +62,7 @@ DEFAULT_TEMP_TTL = 300
 # 历史：曾 12 小时（隔夜续播复用旧实体 → 「昨天最后看的部今天早上
 # 必卡」）→ 4 小时（v2.1.12）→ 90 秒（v2.2.0）。
 #
-# 【v2.2.19 修正 —— 用户实测"播到后面突然跳回起播点"】
+# 【v2.2.20 修正 —— 用户实测"播到后面突然跳回起播点"】
 # 5 分钟太小了。用户看一集电视剧，播到后面时画面**跳回起播点，连跳两三次**，
 # 时间点正好是每 5 分钟一次。原因就在这个值：
 #
@@ -94,11 +94,11 @@ MAX_SESSION_TTL = SESSION_TTL
 # 临时目录的概率可以忽略；真删了，秒传会失败并触发强制重查（见
 # _create_in_temp_dir），不会卡死。
 #
-# 【v2.2.19】60 秒 → 600 秒。这台服务器可能在海外，每次 list 根目录
+# 【v2.2.20】60 秒 → 600 秒。这台服务器可能在海外，每次 list 根目录
 # 都要跨国际线路走一趟；而「用户恰好在 10 分钟内删掉临时目录」这种事
 # 概率极低，且真发生了也有兜底（秒传失败 → 强制重查重试），不会卡死。
 #
-# 【v2.2.19】600 秒 → 1800 秒。用户实测一个来回约 1 秒，这一秒不该
+# 【v2.2.20】600 秒 → 1800 秒。用户实测一个来回约 1 秒，这一秒不该
 # 白花在"确认临时目录还在不在"上。后台保温线程每 240 秒会调一次
 # ensure_temp_dir()，到 1800 秒时由**后台**去刷新，用户请求几乎总能
 # 命中缓存。安全性同上：真删了有秒传失败的兜底。
@@ -295,6 +295,20 @@ class CASRestorer:
         # 播放中反复请求直链时，只复用这里的临时文件重新取一次直链，
         # 绝不重新秒传还原 —— 否则一部电影会被反复还原出几十 GB。
         self._sessions = {}
+        # 最近还原过、但已经被新会话顶替掉的临时文件 ID。
+        #
+        # 【v2.2.20 修「续播跳回起播点」】清扫临时目录时靠 _active_temp_ids()
+        # 判断"谁还在被使用、要绕开谁"，而它读的就是 _sessions ——
+        # 一部片子只留一条记录。于是续播时新文件一登记，旧文件的 ID 就被
+        # 顶掉、从保护名单上消失，紧接着的清扫把它当"闲置副本"删掉。
+        # 而播放器手上还攥着指向那个旧文件的链接 → 它一取数据就失败 →
+        # 表现就是用户看到的「续播后跳回起播点」。
+        #
+        # 这里保留一小段"刚被顶替"的文件 ID（只记 ID 和时刻，不占资源），
+        # 让清扫绕开它们。播放器拿到直链后就钉死在上面，它随时可能回来取
+        # 数据，所以这些文件必须活到延迟删除真正到期为止。
+        self._recent_temp_ids = {}
+        self._recent_temp_ttl = 3600      # 记住 1 小时，盖过延迟删除的窗口
         # 后台清扫去重：同一片名同时只跑一个清扫线程
         self._sweeping = set()
         self._sweep_lock = threading.Lock()
@@ -329,11 +343,11 @@ class CASRestorer:
         能直接省掉这两次往返。同一个 file_id 的 .cas 内容不会变，
         缓存 6 小时安全（换链通常 15 分钟一次）。
 
-        【v2.2.19】缓存改为**落盘**：以前只在内存里，容器一重启或隔夜
+        【v2.2.20】缓存改为**落盘**：以前只在内存里，容器一重启或隔夜
         就全没了，续播又要重新付这两次往返 —— 而服务器如果在海外，
         这两次就是好几秒。这两秒是纯浪费，因为它取的东西永远不变。
 
-        【v2.2.19】加**按文件的解析锁**：以前这里是 check-then-act，
+        【v2.2.20】加**按文件的解析锁**：以前这里是 check-then-act，
         浏览器并发发两条播放请求时两边都查不到缓存、于是**各读一遍云盘**
         —— 又是两次往返白扔。用户诊断里那两条重叠的请求（9.5s + 4.8s），
         第二条本来只该花几百毫秒，结果把第一遍的活又干了一遍。
@@ -673,15 +687,35 @@ class CASRestorer:
         """有没有还能用的已还原会话。"""
         with self._state_lock:
             sess = self._sessions.get(cas_file_id)
-        if not sess:
-            return None
-        if time.time() - sess["created_at"] > self.max_session_ttl:
-            with self._state_lock:
+            if not sess:
+                return None
+            if time.time() - sess["created_at"] > self.max_session_ttl:
+                # 【v2.2.20 关键】会话过期要丢掉，但**必须把它登记的临时文件
+                # 记进保护名单**再丢。否则这个文件从保护名单上消失，紧接着
+                # 的清扫（续播会走全新秒传并触发清扫）就把它当"闲置副本"
+                # 删掉 —— 而播放器手上还攥着指向它的链接。
+                #
+                # 这正是「续播跳回起播点」的最后一环：用户退出后隔了 1 小时
+                # (> SESSION_TTL=30 分钟)，回来续播 → 进到这里 → 会话连同
+                # 保护名单一起被清空 → 旧文件被扫掉 → 播放器的旧链接变死链。
+                self._recent_temp_ids[sess["temp_id"]] = time.time()
                 self._sessions.pop(cas_file_id, None)
-            return None
+                return None
         return sess
 
     def _drop_session(self, cas_file_id):
+        """丢掉会话，但把它登记的临时文件留在保护名单里。"""
+        current = 0
+        _active = time.time()
+        with self._state_lock:
+            sess = self._sessions.pop(cas_file_id, None)
+            if sess and sess.get("temp_id"):
+                self._recent_temp_ids[sess["temp_id"]] = _active
+                current = _active
+        return sess
+
+    def _drop_session_hard(self, cas_file_id):
+        """彻底丢掉会话（调用方已确认那个临时文件确实不该再被使用）。"""
         with self._state_lock:
             return self._sessions.pop(cas_file_id, None)
 
@@ -702,9 +736,33 @@ class CASRestorer:
         return bool(dropped)
 
     def _active_temp_ids(self):
-        """所有正在被复用（不该被清扫）的临时文件 ID。"""
+        """所有正在被复用、或者**刚被顶替但可能还在播**的临时文件 ID。
+
+        【v2.2.20】光看 _sessions 不够：一部片子只留一条会话，续播换了新
+        文件之后，旧文件就从名单上消失、被清扫当闲置删掉 —— 而播放器可能
+        还攥着指向它的链接。所以把"刚被顶替"的那一段也一并保护起来。
+        """
+        now = time.time()
         with self._state_lock:
-            return {s["temp_id"] for s in self._sessions.values()}
+            ids = {s["temp_id"] for s in self._sessions.values()}
+            for tid, at in list(self._recent_temp_ids.items()):
+                if now - at > self._recent_temp_ttl:
+                    self._recent_temp_ids.pop(tid, None)
+                else:
+                    ids.add(tid)
+            return ids
+
+    def _remember_temp(self, temp_id):
+        """记下"这个临时文件刚被新会话顶替"，清扫时绕开它。"""
+        if not temp_id:
+            return
+        now = time.time()
+        with self._state_lock:
+            self._recent_temp_ids[temp_id] = now
+            if len(self._recent_temp_ids) > 500:
+                for tid in sorted(self._recent_temp_ids,
+                                  key=lambda t: self._recent_temp_ids[t])[:100]:
+                    self._recent_temp_ids.pop(tid, None)
 
     def _gc_sessions(self):
         """丢掉过期会话和没人用的单飞锁，避免长期运行后无限增长。"""
@@ -889,8 +947,17 @@ class CASRestorer:
             link, size, temp_id, real_name, base_name = self.restore_temp(
                 cas_file_id, cas_name
             )
-            # 先登记会话再清扫：这样新文件会被列入保护名单，不会被自己清掉
+            # 先登记会话再清扫：这样新文件会被列入保护名单，不会被自己清掉。
+            # 同时把**被顶替掉的旧文件**也记进保护名单 —— 播放器拿到直链后
+            # 就钉死在上面了，续播换了新文件不代表它不用旧的了（v2.2.20）。
+            #
+            # 注意顺序：必须在启动后台清扫**之前**把两件事都做完。清扫是
+            # 另一个线程，它读保护名单时如果这边还没登记完，就会把旧文件
+            # 当成"闲置副本"删掉 —— 那正是「续播跳回起播点」的成因。
             with self._state_lock:
+                old = self._sessions.get(cas_file_id)
+                if old and old.get("temp_id") != temp_id:
+                    self._recent_temp_ids[old["temp_id"]] = time.time()
                 self._sessions[cas_file_id] = {
                     "temp_id": temp_id,
                     "name": real_name,
