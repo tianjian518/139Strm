@@ -54,7 +54,7 @@ CAS_LINK_MAX_TTL = 4 * 60
 CAS_TEMP_GRACE = 120
 # 临时文件的**最短**寿命（秒）。
 #
-# 【v2.2.20 —— 修「播到一半画面跳回起播点」】
+# 【v2.2.21 —— 修「播到一半画面跳回起播点」】
 # 用户看一集 24 分钟的剧，播到第 12 分钟时画面几秒钟内连跳两三次回到起点。
 # 时间账一对就清楚了（临时文件按 cas_temp_ttl=300 秒、即最后一次请求后
 # 6 分钟被删）：
@@ -77,7 +77,7 @@ CAS_TEMP_GRACE = 120
 CAS_TEMP_MIN_TTL = 30 * 60
 # 缓存里的直链多久探一次（秒）。
 #
-# 【v2.2.20】v2.2.9 曾把它废成 0（每次请求都探），理由是「这 60 秒里链坏了
+# 【v2.2.21】v2.2.9 曾把它废成 0（每次请求都探），理由是「这 60 秒里链坏了
 # 照样往外发」。用户的甲骨文诊断数据推翻了那个决定：热路径上只剩探测一步
 # 却要 4.8 秒 —— 说明**在海外服务器上探测本身很贵**。每次播放都白等几秒，
 # 代价远超它防住的那点风险。恢复 60 秒节流（这也是 v2.2.2 生产验证过的值）。
@@ -112,7 +112,7 @@ PLAY_REQUEST_DEADLINE = 25
 # ----------------------------------------------------------------------
 # 探测熔断：防止「探不到 → 判链死刑 → 重建」演变成还原风暴
 # ----------------------------------------------------------------------
-# 【v2.2.20 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
+# 【v2.2.21 关键修复】这里的阈值从 8 降到 3，而且改成数「新链被判坏」。
 #
 # 事情是这样的：交链前探测直链，是 v2.2.3 才加进来的。v2.2.2 及以前
 # 交链前**完全不探测**，而那一版在生产上跑了很久、从没出过问题。
@@ -272,7 +272,7 @@ _clients = {}
 _clients_lock = threading.Lock()
 # 建 client（含 init 的两次接口往返）单独串行。
 #
-# 【v2.2.20】以前 init 在锁外调用，浏览器并发发两条播放请求时，
+# 【v2.2.21】以前 init 在锁外调用，浏览器并发发两条播放请求时，
 # **两边都会各 init 一遍** —— 白扔两次跨国际线路的往返。用户诊断里
 # 那两条重叠的请求（9.5 秒 + 4.8 秒）就有这个成分：第二条进来时
 # 第一条还在建连接，于是它也建了一遍。
@@ -343,6 +343,19 @@ def get_restorer(cfg, client):
         rest.allow_all_ext = bool(cfg.get("cas_allow_all_ext"))
         rest.set_temp_dir(cfg.get("cas_temp_dir_id") or "")
         return rest
+
+
+def _get_restorer_if_any():
+    """已经存在的还原器（没有就返回 None，**不新建**）。
+
+    【v2.2.21】续播判定要用它问一句"这部片子之前还原过吗"。
+    注意不能调 get_restorer() —— 那个会顺手创建临时目录，
+    在"判定"这种只读场合不该有副作用。
+    """
+    cfg = load_config()
+    key = cfg.get("authorization", "")
+    with _restorer_lock:
+        return _restorers.get(key)
 
 
 def remember_temp_dir(cfg, dir_id):
@@ -872,7 +885,7 @@ def api_strm_status():
 def _amz_deadline(url):
     """从预签名直链里读出**真正的**过期时刻（unix 秒）；读不到返回 None。
 
-    实测（v2.2.20）：139 给的是对象存储的预签名 URL，形如
+    实测（v2.2.21）：139 给的是对象存储的预签名 URL，形如
         https://<bucket>.eos.<region>.cmecloud.cn/<obj>
             ?X-Amz-Algorithm=AWS4-HMAC-SHA256
             &X-Amz-Date=20260910T012236Z      ← 签发时刻（UTC）
@@ -898,7 +911,7 @@ def _amz_deadline(url):
 def _link_expire(url, default_ttl, max_ttl=None):
     """按直链自己的过期时间来决定缓存多久。
 
-    【v2.2.20 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
+    【v2.2.21 更正】以前这里读的是 URL 里的 `t` 参数，注释里写着
     「t 是过期时间戳」。实际上 `t` 恒等于 2 —— 那是个标志位，不是
     时间戳。于是 `now - 86400 < 2 < now + 86400` 永远不成立，判断
     永远落空，**永远走兜底值**。连带后果是诊断页里显示的「直链余命」
@@ -998,7 +1011,7 @@ def _probe_status():
 
 # 探测专用连接池。
 #
-# 【v2.2.20 关键优化】以前探测用的是 requests.get()，**每次都新建一条连接** ——
+# 【v2.2.21 关键优化】以前探测用的是 requests.get()，**每次都新建一条连接** ——
 # 新建连接要 TCP 握手 + TLS 握手，一共 3 个来回。本地感觉不到（一个来回
 # 0.5 毫秒），但服务器在海外、一个来回几百毫秒到一两秒时，光是"重新握手"
 # 就要好几秒 —— 而这笔钱每次探测都要重付一遍。
@@ -1101,7 +1114,7 @@ def _cas_link_dead(key, url):
     """
     缓存里的这条直链**现在**还能不能真的取到数据。
 
-    【v2.2.20 —— 数据驱动的回退】
+    【v2.2.21 —— 数据驱动的回退】
     v2.2.9 我把这里的「60 秒节流」去掉了，理由是「这 60 秒窗口里链坏了
     照样往外发」。当时我以为探测很便宜（本地实测 0.2 秒）。
     用户从甲骨文发回来的诊断数据推翻了这个前提：
@@ -1150,7 +1163,7 @@ def _fresh_link_broken(key, url, cas_name=""):
     """
     刚签发的直链是不是根本用不了。
 
-    【v2.2.20 更正 —— 这是整场排查的落点】
+    【v2.2.21 更正 —— 这是整场排查的落点】
     这里以前是无条件相信探测结果：探不到就删掉重还原。在海外服务器上
     这是个灾难 —— 服务器跨国际线路去看国内 CDN，探测经常探不到，
     于是一个播放请求就删文件、重还原一份，播放器一路转圈。
@@ -1202,13 +1215,13 @@ def _cache_put(key, value):
 #
 # 结论：与其去猜旧状态哪里坏了，不如**续播时把旧状态全部丢掉，
 # 走一条和全新播放一模一样的路**。状态空间直接坍缩，玄学无处藏身。
-RESUME_IDLE_GAP = 180      # 距上次来要链超过这么久，又带非零 Range → 判为续播
+RESUME_IDLE_GAP = 180      # 距上次来要链超过这么久 → 判为续播
 _last_served = {}          # file_id -> 上次成功交链的时刻
 _last_served_lock = threading.Lock()
 # 每个片子**每一次**来请求的时刻（不管成没成）。用来算「距上次请求隔了多久」——
 # 这是判断「这次是续播还是播放中的 seek」最直接的证据。
 #
-# 【v2.2.20】这份记录**落盘**。
+# 【v2.2.21】这份记录**落盘**。
 # 起因：用户升级（重建容器）后马上播第 135 集，服务端却判成了「新播」——
 # 因为它重启后内存里空空如也，以为这部片子从没播过。而判续播的唯一依据
 # 就是这个时间戳，它一丢，续播判定就整个失效。
@@ -1299,40 +1312,101 @@ def _mark_served(file_id):
             _last_served[file_id] = time.time()
 
 
-def _is_resume(file_id, gap=None):
+def _is_playback_start():
+    """这条请求是不是「一次播放会话的开头」。
+
+    播放器起播时发的第一条请求，要么不带 Range，要么就是 bytes=0-0
+    （只问文件大小，不取数据）。这两种都没有真实的数据偏移，是
+    「会话开始」的标志。
+
+    【v2.2.21 新增】用来把「续播的第一条请求」从一堆请求里认出来。
+    """
+    rng = (request.headers.get("Range") or "").strip().lower()
+    if not rng:
+        return True
+    return rng in ("bytes=0-0", "bytes=0-1", "bytes=0-")
+
+
+_resume_why = threading.local()   # 这次请求的续播判定依据（"gap" / "trace"）
+
+
+def _has_server_trace(file_id, use_cas):
+    """服务端这边对这部片子有没有"痕迹"。
+
+    痕迹 = 链接缓存里还留着它的直链，或者还有它的还原会话 / 保护名单。
+
+    【v2.2.21 新增】意义：真·第一次播放的片子，服务端是**空空如也**的；
+    反过来，服务端有痕迹却查不到"上次访问记录"，说明记录丢了
+    （容器重建、配置卷没挂上、诊断清过）—— 这时候播放器带着记忆点
+    回来，十有八九是**续播**，不能当成新播。
+    """
+    key = ("cas:" + file_id) if use_cas else file_id
+    with _cache_lock:
+        if _link_cache.get(key):
+            return True
+    if use_cas:
+        try:
+            restorer = _get_restorer_if_any()
+            if restorer is not None and restorer.session_count():
+                # 会话是按 file_id 登记的，这里只问"有没有"
+                if restorer.has_session(file_id):
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def _is_resume(file_id, gap=None, use_cas=False):
     """这次请求是不是「播到一半退出去、过了一阵子回来接着播」。
 
-    【v2.2.20 —— 用户实测纠正】
+    【v2.2.21 —— 用户实测纠正】
     以前这里是「Range 起点必须大于 0」**且**「距上次交链超过 180 秒」，
-    两个条件都要满足。用户拿真实数据证明这个判据是坏的：
-
-        10:53:58  第134集  耗时 2424ms  距上次 648 秒   ← 明明是续播
-        10:54:25  02 4K    耗时 1934ms  距上次 250 秒   ← 明明是续播
-
-    服务端却把这两条全判成了「新播」。两个原因：
-
-      1. **浏览器播 HTML5 视频，续播的第一条请求是"从头"的**
-         （Range=(无) 或 bytes=0-0，起点都是 0），带偏移的真身跟在
-         后面。只认 Range 的话，这第一条立刻被判成「新播」；
-      2. 就算真身带了偏移，也过不了第二关 —— 因为**第一条探测请求
-         2 秒前刚更新过「上次交链时刻」**，算出来是「2 秒前」，
-         于是被当成「播放中拖进度条」。
-
-    两条判据互相打架，结果是续播**永远走不到**「丢弃旧状态」那条路上，
-    一直复用旧链 —— 而旧链正是所有「一直加载中」的温床。
+    两个条件都要满足。用户拿真实数据证明这个判据是坏的。
 
     【判据：只看时间间隔】
     Range 长什么样是**误导**：续播时浏览器发的第一条不带偏移，而播放中
     拖进度条却带偏移 —— 拿 Range 当判据，两个方向都会判错。
-    真正区分「续播」和「拖进度条」的只有一件事：**多久没人来要过链**。
+    真正区分「续播」和「拖进度条」的是：**多久没人来要过链**。
       * 拖进度条：几秒前刚来过（连续播放中）；
       * 续播：几十分钟、几小时、隔夜（停过一阵子）。
 
-    所以现在只看 gap（距上次访问的秒数，由调用方在更新记录**之前**算好）。
-    误判的代价只是「多花一两秒重新秒传一次」；而且因为记录会被立刻更新，
-    同一个片子最快也只能每 RESUME_IDLE_GAP 秒重来一次，不会变成还原风暴。
+    【v2.2.21 —— 补第三条兜底：无记录但有痕迹】
+    只看间隔还有个大漏洞，用户实测踩中（第 191 集）：
+
+        16:21:57  续播请求  Range=(无)  距上次=**无记录**  → 判成「新播」
+                  → 走新播路径 → 播放器拿到新链接 → **跳回 0 秒**
+        16:36:40  续播请求  Range=(无)  距上次=828 秒      → 判成「续播」
+                  → 复用同一文件/链接 → 播放器看到同一个源 → **正常**
+
+    同一个动作、同样的请求，只因为"记录在不在"而判出两种结果 ——
+    而"没有记录"的情形其实很常见：**这部片子在本服务端是第一次播**
+    （之前播的是别的集）、容器刚重建过、播放记录被清过。
+    这时候 gap 算出来是 0，判决就整个失效了。
+
+    所以补一条：**没有记录、但服务端有这部片子的痕迹、而且这是起播请求**
+    → 判为续播。三个条件缺一不可：
+
+      * 没有记录（gap==0）—— 有记录的正常走上面那条；
+      * 起播请求 —— **挡住"播放中拖进度条"**（拖动带偏移）；
+      * 服务端有痕迹 —— **挡住"真的第一次播"**（真新播服务端没痕迹）。
+
+    误判的代价只是「多花一两秒重新秒传一次」，不影响观看；
+    而且"服务端有痕迹"这个条件保证了**不会高频触发**，
+    不会重演 v2.1.8 那种还原风暴。
     """
-    return gap is not None and gap > RESUME_IDLE_GAP
+    # 一、有记录：间隔够久就是续播
+    if gap and gap > RESUME_IDLE_GAP:
+        _resume_why.reason = "gap"
+        return True
+    # 二、没记录：有痕迹 + 起播请求 → 也是续播
+    if not gap and _is_playback_start() and _has_server_trace(file_id, use_cas):
+        app.logger.info(
+            "续播判定兜底命中（无记录但有痕迹）file=%s cas=%s",
+            file_id[:12], use_cas)
+        _resume_why.reason = "trace"
+        return True
+    _resume_why.reason = ""
+    return False
 
 
 def _get_link(client, file_id, resume=False):
@@ -1378,7 +1452,7 @@ _play_locks_lock = threading.Lock()
 _play_meta = threading.local()
 # 已知的还原文件大小：file_id -> 字节数。
 #
-# 【v2.2.20】为什么要记这个：用户反馈「第 138 集播到 12 分钟左右，
+# 【v2.2.21】为什么要记这个：用户反馈「第 138 集播到 12 分钟左右，
 # 几秒钟之内连跳两三次回到起点」，而其他集都正常。
 # 这个特征（只有某一片、在某个时间点、短时间内反复跳）指向一种可能：
 # **播放器以为这一集还有内容，但文件其实已经到末尾了** —— 它请求一个
@@ -1438,7 +1512,7 @@ def _get_cas_link_inner(client, cfg, file_id, cas_name, resume=False):
     if resume:
         # 续播 = 全新播放：旧**链接**状态一个都不信任。
         #
-        # 【v2.2.20 关键修复】这里以前还调了 restorer.forget_session(file_id)，
+        # 【v2.2.21 关键修复】这里以前还调了 restorer.forget_session(file_id)，
         # 那是个 bug，正是「续播时跳回起播点」的真凶：
         #
         #   forget_session 把旧会话从登记表里摘掉 → 紧接着的"全新秒传"分支
@@ -1607,7 +1681,7 @@ def _resolve_play_url(cfg, file_id, cas_name, use_cas, resume=False):
 def _invalidate_link(file_id, use_cas, cfg=None):
     """丢掉缓存的直链，逼下一次请求换一条新的。
 
-    【v2.2.20】这里以前还会 forget_session，同样是那个"顺手把文件花名册
+    【v2.2.21】这里以前还会 forget_session，同样是那个"顺手把文件花名册
     清空 → 清扫把旧副本全删掉 → 播放器手上的链接变死链"的坑。
     只丢链接缓存就够了：下一次请求会自动走"全新秒传"。
     """
@@ -1645,7 +1719,7 @@ def _proxy_stream(file_id, cfg, cas_name, use_cas):
         gap = int(time.time() - _prev) if _prev else 0
         _last_seen[file_id] = time.time()
     _save_last_seen()
-    resume = _is_resume(file_id, gap)
+    resume = _is_resume(file_id, gap, use_cas)
     set_request_deadline(PLAY_REQUEST_DEADLINE)
     try:
         url, err = _resolve_play_url(cfg, file_id, cas_name, use_cas, resume)
@@ -1741,7 +1815,7 @@ def direct_link(file_id):
             _last_seen.clear()
             _last_seen.update(keep)
     _save_last_seen()          # 节流落盘：重启后仍认得出「续播」
-    resume = _is_resume(file_id, gap)
+    resume = _is_resume(file_id, gap, use_cas)
     # 给这次请求套一个总时限：再慢也不会「加载到天荒地老」，
     # 最坏是等一会儿快速失败，用户重试时状态已热、秒开。
     set_request_deadline(PLAY_REQUEST_DEADLINE)
@@ -1768,6 +1842,7 @@ def direct_link(file_id):
                   rng=rng_raw, ua=ua_raw[:40], gap=gap,
                   calls=calls, call_ms=call_ms, newfile=newfile,
                   size=fsize, want=want, oversize=oversize,
+                  rwhy=(getattr(_resume_why, "reason", "") if resume else ""),
                   err=(err.get_data(as_text=True) or "")[:160])
         return err
 
@@ -1779,7 +1854,8 @@ def direct_link(file_id):
               ms=int((time.time() - t0) * 1000), life=max(life, 0),
               resume=resume, rng=rng_raw, ua=ua_raw[:40], gap=gap,
               calls=calls, call_ms=call_ms, newfile=newfile,
-              size=fsize, want=want, oversize=oversize)
+              size=fsize, want=want, oversize=oversize,
+              rwhy=(getattr(_resume_why, "reason", "") if resume else ""))
     resp = redirect(url, code=302)
     # 防缓存头给全：任何一层（播放器自己的 HTTP 栈、中间反代）只要缓存了
     # 这个 302，之后就会一直用那条会过期的云盘直链 —— 表现就是
@@ -1798,7 +1874,7 @@ def direct_link(file_id):
 _DIAG_MAX = 40
 _diag = collections.deque(maxlen=_DIAG_MAX)
 _diag_lock = threading.Lock()
-# 【v2.2.20】诊断记录**落盘**。
+# 【v2.2.21】诊断记录**落盘**。
 # 用户反馈：升级（重建容器）后之前的记录全没了，想跟升级前对比都做不到。
 # 记录只放内存里就是这个下场 —— 而"升级前后对比"恰恰是排查这类问题时
 # 最有用东西。落盘后可以跨重启保留。
@@ -2340,7 +2416,7 @@ def _warm_cdn():
 
 
 def _keep_warm_loop():
-    # 【v2.2.20】启动后**立刻**热一遍，不等第一个间隔。
+    # 【v2.2.21】启动后**立刻**热一遍，不等第一个间隔。
     # 用户实测：容器刚重建时点播放要 8.4 秒，跑了一会儿之后只要 5.3 秒 ——
     # 差的 3 秒全是"从零建连接"。而保温线程原来要等 240 秒才第一次跑，
     # 正好把用户升级后第一次播放晾在最冷的时刻。
