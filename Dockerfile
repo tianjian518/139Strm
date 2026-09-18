@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 LABEL org.opencontainers.image.title="139Strm" \
       org.opencontainers.image.description="移动云盘(139) STRM 生成器与 302 直链服务，原生支持 .cas 秒传文件播放" \
-      org.opencontainers.image.source="https://github.com/tianjian518/139Strm" \
+      org.opencontainers.image.source="https://github.com/tianjian518/139strm" \
       org.opencontainers.image.licenses="MIT"
 
 WORKDIR /app
