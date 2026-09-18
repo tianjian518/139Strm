@@ -2578,9 +2578,67 @@ def start_keep_warm():
                      daemon=True).start()
 
 
+# 【v2.2.24】临时目录自动清扫
+# 为什么需要：原来只有 _pending 内存字典 + reaper 线程负责删临时文件，
+# 进程一重启 _pending 就清空，重启前登记的临时文件从此无人认领、永远残留。
+# 用户实测残留过一个 678MB 的 TEMP_xxx.mkv。这里做兜底：
+#   ① 启动后立刻扫一次，专门回收「上次进程遗留」的孤儿；
+#   ② 之后每小时扫一次，清理创建超过 AUTO_PURGE_MIN_AGE 秒的残留。
+# 定时清扫只按「文件年龄」判定，不动 _pending 正在保护的新文件，因此不会误删正在播放的。
+TEMP_PURGE_INTERVAL = int(os.environ.get("TEMP_PURGE_INTERVAL", 3600))
+TEMP_PURGE_MIN_AGE = int(os.environ.get("TEMP_PURGE_MIN_AGE", 3600))
+_temp_purge_started = False
+
+
+def _purge_temp_once(reason, max_age):
+    """按账号逐个清扫临时目录；任何异常都吞掉，不影响主流程。"""
+    try:
+        cfg = load_config()
+        if not cfg.get("authorization"):
+            return
+        if not cfg.get("cas_enabled", True):
+            return
+        client = get_client(cfg)
+        rest = get_restorer(cfg, client)
+        if not rest.find_temp_dir():
+            return  # 还没建过临时目录，没什么可清的
+        removed = rest.purge_temp_dir(max_age=max_age)
+        if removed:
+            app.logger.info("临时目录自动清扫[%s]：清理 %s 个残留文件", reason, removed)
+        else:
+            app.logger.info("临时目录自动清扫[%s]：无残留", reason)
+    except Exception as exc:
+        app.logger.info("临时目录自动清扫[%s]跳过一轮：%s", reason, exc)
+
+
+def _temp_purge_loop():
+    # 第一次：无条件清空（max_age=0）——进程刚起来，临时目录里的东西
+    # 必然是上一个进程留下的，且此刻不存在任何正在播放的会话，尽管清。
+    _purge_temp_once("启动兜底", 0)
+    while True:
+        try:
+            time.sleep(TEMP_PURGE_INTERVAL)
+            # 之后按年龄清，避免误删刚生成、可能还在播的文件
+            _purge_temp_once("定时", TEMP_PURGE_MIN_AGE)
+        except Exception as exc:
+            app.logger.info("临时目录清扫线程异常（忽略）: %s", exc)
+
+
+def start_temp_purge():
+    """启动临时目录自动清扫线程（只起一次）。"""
+    global _temp_purge_started
+    with _clients_lock:
+        if _temp_purge_started:
+            return
+        _temp_purge_started = True
+    threading.Thread(target=_temp_purge_loop, name="139strm-temp-purge",
+                     daemon=True).start()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8025))
     threading.Thread(target=_task_scheduler_loop, name="139strm-task-scheduler",
                      daemon=True).start()
     start_keep_warm()
+    start_temp_purge()
     app.run(host="0.0.0.0", port=port, threaded=True)
