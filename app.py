@@ -100,7 +100,15 @@ CAS_TEMP_GRACE = 120
 #
 # 代价：停止播放后临时文件会多留半小时才清掉（一部片子一份，不会堆积）。
 # 相比"看到一半被打回起点"，这个代价可以接受。
-CAS_TEMP_MIN_TTL = 30 * 60
+#
+# 【v2.2.23 —— 再放宽到 45 分钟】
+# 30 分钟这个值算错了账：它按"直链 900 秒"来估，可**真正在用文件的不是
+# 直链，是播放器**。播放器可以暂停十几分钟再继续（暂停期间一个请求都不发，
+# 文件不会被续期），也可以把一条 12 分钟的链一直用到它到期为止。
+# 只要文件比"链到期 + 播放器继续用"这两段加起来短，它就会成为先垮的那一环。
+# 45 分钟 = 12 分钟链寿命的将近 4 倍，把暂停的余量也算进去了。
+# 仍然一部片子只留一份，不会堆积。
+CAS_TEMP_MIN_TTL = 45 * 60
 # 缓存里的直链多久探一次（秒）。
 #
 # 【v2.2.22】v2.2.9 曾把它废成 0（每次请求都探），理由是「这 60 秒里链坏了
@@ -162,10 +170,15 @@ PROBE_SLOW_PAUSE = 300
 _probe_fail_streak = 0           # 连续「根本没探成」（超时/网络异常）
 _dead_streak = 0                 # 连续「刚还原的新链被判坏」
 _probe_fail_until = 0
-# 「删掉重还原」的补救多久之内不重复做（秒）。万一 CDN 压根不接受 Range
-# 探测（每条链都回 4xx），没有这个冷却就会每次换链都白搭一次秒传，
-# 换集直接慢一倍 —— 真遇到这种情况，认赔一次比一直赔划算。
-CAS_VERIFY_RETRY_COOLDOWN = 600
+# 补救动作多久之内不重复做（秒）。
+#
+# 【v2.2.23】从 600 秒收到 120 秒，因为补救动作本身变了：
+# 以前补救 = 删文件 + 重新秒传（贵，必须压着频率，600 秒可以理解）；
+# 现在补救 = **对同一文件重签一条链**（便宜、幂等、不动文件）。
+# 既然不再有"还原风暴"的风险，600 秒的冷却就只剩下副作用了 ——
+# 它会让一条真坏掉的链在 10 分钟里反复被交出去，用户干等。
+# 120 秒足够挡住高频重试，又不至于把真问题拖成长痛。
+CAS_VERIFY_RETRY_COOLDOWN = 120
 _verify_retried = {}
 
 # 一次 Range 探测的结论
@@ -1623,6 +1636,23 @@ def _get_cas_link_inner(client, cfg, file_id, cas_name, resume=False):
                 app.logger.info("链只剩 %d 秒，对同一文件重签链接（%s）",
                                 max(int(remain), 0), cas_name)
                 return fresh
+            # 【v2.2.23】重签失败也**绝不换文件**。
+            #
+            # 走到这里说明链快到期、想给它续一条，但重签没成功。旧写法是
+            # 放任往下走 → fetch_link 全新秒传 → **新文件顶替旧文件** →
+            # 播放器手上那条链接指向的文件被清扫掉 → 跳回起播点。
+            # 为了几秒钟的"链快到期"就换文件，代价是用户跳回起点，完全不值。
+            #
+            # 正确做法：把旧链照旧交出去（它这会儿**还没过期**，还能用），
+            # 同时把临时文件的寿命往后延，别让文件比链先垮。等它真到期了、
+            # 下一个请求再来时，重签还有一次机会。
+            restorer.schedule_delete(
+                temp_id, delay=max(int(restorer.temp_ttl or 0),
+                           int(CAS_TEMP_MIN_TTL), CAS_TEMP_GRACE + 300))
+            app.logger.info(
+                "重签失败，仍交出旧链（还剩 %d 秒）并延长文件寿命，不换文件: %s",
+                max(int(remain), 0), cas_name)
+            return url
         # 探测说这条链废了（多半是用户在云盘里手动删了临时文件）→ 想重建。
         # 但重建必须受冷却约束：万一「探不到」其实是我们自己到 CDN 的路
         # 不通（链对播放器是好的），没有冷却就会变成「来一个请求还原一份」
@@ -1658,17 +1688,43 @@ def _get_cas_link_inner(client, cfg, file_id, cas_name, resume=False):
                 _known_size[file_id] = int(size)
     # 注意 and 的短路：只有确实探到坏链、且熔断器没跳闸，才会走补救
     if _fresh_link_broken(key, url, cas_name) and _verify_retry_allowed(key):
-        # 这条链根本用不了：新还原的文件在 CDN 侧还没同步，或者复用的实体
-        # 其实已经不在了（取直链接口对不存在的文件照样签发 URL，不探一下
-        # 就会把死链发给播放器 —— 表现是「一直加载中，返回重播才正常」）。
-        # 播放器 follow 302 后就钉在这条 URL 上了，所以必须现在就补救。
-        app.logger.warning("刚取到的直链不可用（%s），删掉重还原一次", cas_name)
-        restorer.delete_quietly(temp_id)     # 这条确实是坏的，明确删掉
-        # 但**不** forget_session：这一条要重建，不代表这部片子的**其它**
-        # 副本也是坏的。留着登记表，重建触发清扫时才能绕开它们 ——
-        # 那些副本可能正被播放器用着（用户手上可能开着好几个播放器实例）。
-        url, size, temp_id, real_name, restored = restorer.fetch_link(
-            file_id, cas_name)
+        # 【v2.2.23 —— 只换链，绝不换文件】
+        #
+        # 这里以前是 `delete_quietly(temp_id)` + `fetch_link()` —— 把刚还原
+        # 的文件删掉、再秒传一个新的出来。这是「播到一半跳回起播点」在
+        # 302 架构下的**最后一环**，也是升级后问题反而更严重的原因：
+        #
+        #   探测判死 → 删文件 → 重建新文件 → 旧文件（播放器正攥着它的链）
+        #   当场变死链 → 播放器取不到数据 → 跳回起点。
+        #
+        # 而在甲骨文这种海外服务器上，「探测判死」**多半是误判**：服务器
+        # 跨国际线路去看国内 CDN，探不到是常态（诊断里那种 7.8 秒的
+        # 「换了新文件」就是它）。也就是说，一个本来就是好的文件，被我们
+        # 自己的探测给删了。
+        #
+        # 铁律：**刚还原出来的文件不可能是坏的**。既然要重建的只是"链接"
+        # 这一层，那就只重建链接 —— 对**同一个临时文件**重签一条新链。
+        # 文件原地不动，播放器手上那条旧链也不会因为文件被删而立刻断。
+        # 这跟上面「链快到期」那条路是同一个动作，重试一次并不过分。
+        fresh = ""
+        try:
+            fresh = restorer.refresh_link(temp_id)
+        except Exception as exc:
+            app.logger.info("重签链接失败（%s）: %s", cas_name, exc)
+        if fresh:
+            url = fresh
+            app.logger.info(
+                "直链探测判坏，已对同一文件（%s）重签新链，未删文件: %s",
+                temp_id, cas_name)
+        else:
+            # 连重签都拿不到链接：这时才怀疑文件真没了，走重建。
+            # 重建前**不** forget_session —— 那会让清扫把这部片子的其它
+            # 副本一起删掉，而播放器可能正用着它们。
+            app.logger.warning(
+                "重签链接也失败（%s），文件可能真没了，重新秒传还原", cas_name)
+            restorer.delete_quietly(temp_id)
+            url, size, temp_id, real_name, restored = restorer.fetch_link(
+                file_id, cas_name)
     expire = _link_expire(url, LINK_TTL, CAS_LINK_MAX_TTL)
     # 临时文件必须活过缓存：缓存失效后再宽限 CAS_TEMP_GRACE 秒。
     # 不能只看 cas_temp_ttl —— 直链 15 分钟后才过期，这期间播放器拿着旧直链
